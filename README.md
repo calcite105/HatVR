@@ -108,7 +108,7 @@ If you run into something that isn't covered here, feel free to report it.
 
 **BL1GOTYVR** — A useful reference while working with DXVK/Vulkan and Unreal Engine 3's rendering behavior.
 
-**First Person Camera Badge** — Used as a reference for our first person implementation.
+**First Person Camera Badge Mod** — Used as a reference for our first person implementation.
 
 HatVR uses **MinHook**, the **OpenXR SDK**, **DXVK**, **Dear ImGui**, **AMD FidelityFX Super Resolution 1**, and **NVIDIA Image Scaling**.
 
