@@ -1,0 +1,6 @@
+#include "../ui/d3d9_draw_routing.inl"
+#include "../input/xr_xinput_state_and_haptics.inl"
+#include "../devices/psvr2/toolkit_hmd_haptics.inl"
+#include "../input/controller_bridge_and_actions.inl"
+#include "../devices/psvr2/eye_hat_wheel.inl"
+#include "../input/controller_runtime.inl"

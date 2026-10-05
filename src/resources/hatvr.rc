@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDR_CURSE_CASUAL RCDATA "Curse Casual.ttf"

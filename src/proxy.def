@@ -1,0 +1,30 @@
+LIBRARY d3d9
+
+EXPORTS
+    Export_16                               @16 NONAME
+    Export_17                               @17 NONAME
+    Export_18                               @18 NONAME
+    Export_19                               @19 NONAME
+
+    Direct3DCreate9On12=Export_20           @20
+    Direct3DCreate9On12Ex=Export_21         @21
+
+    Export_22                               @22 NONAME
+    Export_23                               @23 NONAME
+
+    Direct3DShaderValidatorCreate9=Export_24 @24
+    PSGPError=Export_25                     @25
+    PSGPSampleTexture=Export_26             @26
+
+    D3DPERF_BeginEvent=Export_27            @27
+    D3DPERF_EndEvent=Export_28              @28
+    D3DPERF_GetStatus=Export_29             @29
+    D3DPERF_QueryRepeatFrame=Export_30      @30
+    D3DPERF_SetMarker=Export_31             @31
+    D3DPERF_SetOptions=Export_32            @32
+    D3DPERF_SetRegion=Export_33             @33
+    DebugSetLevel=Export_34                 @34
+    DebugSetMute=Export_35                  @35
+    Direct3D9EnableMaximizedWindowedModeShim=Export_36 @36
+    Direct3DCreate9=Export_37               @37
+    Direct3DCreate9Ex=Export_38             @38

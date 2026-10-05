@@ -1,0 +1,6 @@
+#include "../avatar/discovery_and_component_inspection.inl"
+#include "../avatar/evaluator_and_pose_diagnostics.inl"
+#include "../avatar/arm_ik_and_controller_targets.inl"
+#include "../avatar/pose_ownership_and_publication.inl"
+#include "../avatar/attachments_and_itempalm_history.inl"
+#include "../avatar/native_setbase_attachment_hook.inl"

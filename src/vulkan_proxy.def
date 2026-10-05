@@ -1,0 +1,12 @@
+LIBRARY "vulkan-1"
+EXPORTS
+    vkGetInstanceProcAddr
+    vkGetDeviceProcAddr
+    vkCreateInstance
+    vkCreateDevice
+    vkDestroyInstance
+    vkDestroyDevice
+    vkQueuePresentKHR
+    vkQueueSubmit
+    vkEnumerateInstanceExtensionProperties
+    vkEnumerateInstanceLayerProperties
