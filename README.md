@@ -37,7 +37,7 @@ Third person is the main way to play and is what I'd recommend for playing throu
 
 Set A Hat in Time's **Graphics API to Vulkan. Do not use DirectX 9 with HatVR.**
 
-HatVR uses the game's DXVK/Vulkan rendering path. The version of DXVK included with the game may work, but I recommend updating the game's DXVK to **DXVK 3.1.1** before using HatVR.
+HatVR uses the game's DXVK/Vulkan rendering path. The version of DXVK included with the game may work, but I recommend updating the game's DXVK to **[DXVK 3.1.1](https://github.com/doitsujin/dxvk/releases/tag/v3.1.1)** before using HatVR.
 
 Download HatVR and place the release files in `HatinTime\Binaries\Win64`. Start SteamVR or your preferred OpenXR runtime and then launch the game normally.
 
