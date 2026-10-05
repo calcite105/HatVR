@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AHiTVR LANGUAGES CXX RC ASM_MASM)
+project(AHiTVR LANGUAGES CXX RC)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "A Hat in Time's Win64 build requires a 64-bit target (-A x64)")
@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
-# --- MinHook ---
+# minhook
 FetchContent_Declare(
     minhook
     GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
@@ -18,8 +18,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
-# --- Dear ImGui (HatVR VR menu renderer) ---
-# Pinned so backend API changes cannot silently break HatVR builds.
+# imgui, used for the vr menu
+# keep this pinned so updates dont randomly break the build
 FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -40,7 +40,7 @@ target_include_directories(hatvr_imgui PUBLIC
     ${imgui_SOURCE_DIR}/backends
 )
 
-# --- OpenXR ---
+# openxr
 set(BUILD_LOADER ON CACHE BOOL "" FORCE)
 set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
 set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
@@ -55,9 +55,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(openxr_sdk)
 
-# --- Vulkan SDK ---
-# Required only to build the DXVK/Vulkan OpenXR backend. The normal DX9 path
-# remains D3D12/OpenXR.
+# vulkan
 find_package(Vulkan REQUIRED)
 message(STATUS "HatVR Vulkan SDK include: ${Vulkan_INCLUDE_DIRS}")
 message(STATUS "HatVR Vulkan SDK version: ${Vulkan_VERSION}")
@@ -66,9 +64,7 @@ target_link_libraries(hatvr_imgui PUBLIC Vulkan::Vulkan)
 # =============================================================================
 # HatVR.dll
 #
-# The actual VR mod. Renderer/UE3/OpenXR state lives here rather than in the
-# system-DLL proxy. d3d9.dll only loads this DLL and hands it the real
-# IDirect3D9 object created by the game.
+# main mod dll, most of hatvr lives here
 # =============================================================================
 add_library(HatVR SHARED
     src/dllmain.cpp
@@ -132,13 +128,30 @@ set_target_properties(HatVR PROPERTIES
 # =============================================================================
 # d3d9.dll
 #
-# Thin compatibility proxy/loader. It forwards the system D3D9 exports and
-# loads HatVR.dll when AHiT enters Direct3DCreate9/Direct3DCreate9On12.
+# small d3d9 proxy that forwards the normal exports and loads HatVR.dll
 # =============================================================================
+
+# do this directly since cmakes masm support can have issues with vs2022
+get_filename_component(HATVR_MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+set(HATVR_ML64 "${HATVR_MSVC_BIN_DIR}/ml64.exe")
+if(NOT EXISTS "${HATVR_ML64}")
+    message(FATAL_ERROR "ml64.exe was not found beside the MSVC compiler: ${HATVR_ML64}")
+endif()
+
+set(HATVR_PROXY_STUBS_OBJ "${CMAKE_CURRENT_BINARY_DIR}/proxy_stubs.obj")
+add_custom_command(
+    OUTPUT "${HATVR_PROXY_STUBS_OBJ}"
+    COMMAND "${HATVR_ML64}" /nologo /c "/Fo${HATVR_PROXY_STUBS_OBJ}" "${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_stubs.asm"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/proxy_stubs.asm"
+    COMMENT "Assembling proxy_stubs.asm"
+    VERBATIM
+)
+set_source_files_properties("${HATVR_PROXY_STUBS_OBJ}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+
 add_library(d3d9 SHARED
     src/dllmain.cpp
     src/proxy_exports.cpp
-    src/proxy_stubs.asm
+    "${HATVR_PROXY_STUBS_OBJ}"
     src/proxy.def
 )
 
@@ -152,5 +165,5 @@ set_target_properties(d3d9 PROPERTIES
     PREFIX ""
 )
 
-# Building d3d9 should also produce the actual mod DLL.
+# building the proxy should build hatvr too
 add_dependencies(d3d9 HatVR)
