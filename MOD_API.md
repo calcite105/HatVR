@@ -4,145 +4,17 @@ HatVR has an optional API for A Hat in Time mods that want access to some of its
 
 The API is disabled by default and can be enabled with **Mod API** in HatVR's settings. HatVR itself does not require it.
 
-## What It Exposes
-
-The current API provides:
-
-- API version and capabilities
-- Whether VR is currently active
-- Whether first-person mode is enabled
-- HMD position and rotation
-- Left controller position and rotation
-- Right controller position and rotation
-- Tracking validity
-- HatVR's solved hand orientation when available
-
-The API is currently read-only. Mods can react to HatVR's state, but cannot change HatVR settings through it.
+The current API is read-only. Mods can react to HatVR's state and tracking data, but cannot change HatVR settings through it.
 
 ## Using the API
 
-HatVR looks for API callbacks on loaded `GameMod` instances.
-
-A mod only needs to implement the callbacks it actually uses. There is no requirement to implement every part of the API.
-
-When HatVR finds a compatible mod, it calls:
+HatVR looks for API callbacks on loaded `GameMod` instances. A mod must implement `HatVRAPI_Initialize` to be detected as an API consumer. Everything else is optional, so only implement the callbacks your mod actually needs.
 
 ```uc
-function HatVRAPI_Connected(int APIVersion, int Capabilities)
+function HatVRAPI_Initialize(int APIVersion, int Capabilities)
 {
 }
 ```
-
-`APIVersion` can be checked before relying on newer API features.
-
-`Capabilities` describes which parts of the API are available.
-
-Mods should continue working normally if HatVR is not installed, the Mod API is disabled, or a particular capability is unavailable.
-
-## State
-
-For basic HatVR state, implement:
-
-```uc
-function HatVRAPI_StateChanged(int StateFlags)
-{
-}
-```
-
-This is intended for state that changes occasionally rather than tracking data that changes continuously.
-
-For example, a mod can use it to tell whether HatVR is active or whether first-person mode is enabled.
-
-## Tracking
-
-Tracking is separated by device. Implement only the callbacks for the devices your mod needs.
-
-For occasional HMD updates:
-
-```uc
-function HatVRAPI_HMD20Hz(
-    vector Position,
-    Quat Orientation,
-    int TrackingFlags)
-{
-}
-```
-
-For the left controller:
-
-```uc
-function HatVRAPI_LeftController20Hz(
-    vector Position,
-    Quat Orientation,
-    Quat SolvedHandOrientation,
-    int TrackingFlags)
-{
-}
-```
-
-And for the right controller:
-
-```uc
-function HatVRAPI_RightController20Hz(
-    vector Position,
-    Quat Orientation,
-    Quat SolvedHandOrientation,
-    int TrackingFlags)
-{
-}
-```
-
-The controller callbacks include both the tracked controller orientation and HatVR's solved hand orientation when available.
-
-Check `TrackingFlags` before using tracking data.
-
-## Tracking Update Rate
-
-Only request tracking as often as your mod actually needs it.
-
-If your mod only needs occasional tracking updates, prefer the 20 Hz callbacks. Use the per-frame callbacks when something needs to closely follow the headset or controllers, such as an attached object.
-
-The per-frame equivalents are:
-
-```uc
-function HatVRAPI_HMDFrame(...)
-function HatVRAPI_LeftControllerFrame(...)
-function HatVRAPI_RightControllerFrame(...)
-```
-
-Per-frame tracking is supported and is designed to be lightweight. HatVR reuses tracking data it already calculates and avoids repeated discovery, function lookup, allocation, and other unnecessary work in the tracking path.
-
-There is no benefit to using the per-frame callbacks when 20 Hz is already enough for what your mod is doing.
-
-## Coordinate Space
-
-Tracking positions and orientations are provided after HatVR's conversion into A Hat in Time's coordinate system.
-
-Controller callbacks may also provide HatVR's solved hand orientation. This is useful when something should follow the orientation HatVR uses for the player's hand rather than the raw controller orientation.
-
-## API Availability
-
-Mods should not assume the API will always be available.
-
-HatVR may not be installed, the player may have **Mod API** disabled, VR may not currently be active, or individual tracked devices may be unavailable.
-
-Treat the API as an optional source of additional information rather than something required for the rest of your mod to function.
-
-## Performance
-
-The API is designed so unused features stay cheap.
-
-HatVR does not continuously send every piece of tracking data to every mod. Only callbacks actually implemented by a consumer are used.
-
-Tracking data is taken from state HatVR already maintains. The tracking path does not perform repeated mod discovery or function lookup.
-
-This also means implementing only what you need is preferable. If you only care about the HMD, there is no reason to implement either controller callback.
-
-## Versioning
-
-Check the version supplied through `HatVRAPI_Connected`.
-
-Existing API behavior will be kept compatible where practical. New functionality may be exposed through later API versions or additional capabilities.
 
 For the initial API:
 
@@ -150,4 +22,129 @@ For the initial API:
 const HATVR_API_VERSION = 1;
 ```
 
-That's all that's required to start using it. Implement the callbacks relevant to your mod, handle the API being unavailable, and use the lowest tracking update rate that makes sense for what you're doing.
+`APIVersion` should be checked before relying on behavior added by later API versions. `Capabilities` is reserved for reporting supported API features.
+
+Mods should continue working normally if HatVR is not installed or the player has **Mod API** disabled.
+
+## State
+
+For HatVR state changes, implement:
+
+```uc
+function HatVRAPI_StateChanged(
+    int APIVersion,
+    int StateFlags,
+    int TrackingMask)
+{
+}
+```
+
+HatVR sends this when the consumer is first registered and again when the state or tracking availability changes.
+
+`StateFlags` currently uses:
+
+- Bit 0 (`1`) - an OpenXR session is running
+- Bit 1 (`2`) - HatVR first person is active
+
+`TrackingMask` currently uses:
+
+- Bit 0 (`1`) - HMD tracking is available
+- Bit 1 (`2`) - left controller tracking is available
+- Bit 2 (`4`) - right controller tracking is available
+
+Check the bits you need rather than assuming every tracked device is available.
+
+## Tracking
+
+Tracking is separated by device. Each tracking callback currently has the same parameter layout:
+
+```uc
+function HatVRAPI_HMD20Hz(
+    int Device,
+    int Valid,
+    float X, float Y, float Z,
+    float Qx, float Qy, float Qz, float Qw,
+    int Pitch, int Yaw, int Roll)
+{
+}
+```
+
+The controller versions are:
+
+```uc
+function HatVRAPI_LeftController20Hz(
+    int Device,
+    int Valid,
+    float X, float Y, float Z,
+    float Qx, float Qy, float Qz, float Qw,
+    int Pitch, int Yaw, int Roll)
+{
+}
+
+function HatVRAPI_RightController20Hz(
+    int Device,
+    int Valid,
+    float X, float Y, float Z,
+    float Qx, float Qy, float Qz, float Qw,
+    int Pitch, int Yaw, int Roll)
+{
+}
+```
+
+`Device` is `0` for the HMD, `1` for the left controller, and `2` for the right controller. `Valid` is `1` when HatVR currently has a valid pose for that device and `0` otherwise. Check `Valid` before using the rest of the pose.
+
+`X`, `Y`, and `Z` are positions converted into A Hat in Time's coordinate system and world-unit scale, relative to HatVR's tracking origin.
+
+`Pitch`, `Yaw`, and `Roll` use Unreal rotator units.
+
+For the HMD, the quaternion is the tracked HMD orientation. For controllers, the quaternion uses HatVR's solved hand orientation when it is available, otherwise it falls back to the tracked controller orientation. The controller `Pitch`, `Yaw`, and `Roll` values are based on the tracked controller orientation.
+
+## Tracking Update Rate
+
+Only request tracking as often as your mod actually needs it.
+
+The callbacks above run at up to roughly 20 Hz. For something that needs to follow a tracked device every rendered frame, use the per-frame equivalent with the same parameters:
+
+```uc
+function HatVRAPI_HMDFrame(
+    int Device, int Valid,
+    float X, float Y, float Z,
+    float Qx, float Qy, float Qz, float Qw,
+    int Pitch, int Yaw, int Roll)
+{
+}
+
+function HatVRAPI_LeftControllerFrame(
+    int Device, int Valid,
+    float X, float Y, float Z,
+    float Qx, float Qy, float Qz, float Qw,
+    int Pitch, int Yaw, int Roll)
+{
+}
+
+function HatVRAPI_RightControllerFrame(
+    int Device, int Valid,
+    float X, float Y, float Z,
+    float Qx, float Qy, float Qz, float Qw,
+    int Pitch, int Yaw, int Roll)
+{
+}
+```
+
+For each device, the per-frame callback takes priority over its 20 Hz callback. If you implement `HatVRAPI_HMDFrame`, for example, HatVR uses that instead of also calling `HatVRAPI_HMD20Hz`. Pick one update rate for each device.
+
+Per-frame tracking reuses data HatVR already calculates. Consumer discovery and callback lookup are cached rather than being repeated in the tracking path, but there is still no reason to request updates every frame when 20 Hz is enough for what your mod is doing.
+
+## API Availability
+
+Mods should treat the API as optional. HatVR may not be installed, **Mod API** may be disabled, VR may not currently be active, or individual tracked devices may be unavailable.
+
+A mod only needs to implement the callbacks it uses, other than `HatVRAPI_Initialize`, which is how HatVR identifies the mod as an API consumer.
+
+**The Mod API is experimental.** It has been tested with a real `GameMod` receiving live tracking data, but it hasn't been tested extensively yet and may change in the future.
+
+## Versioning
+
+Check `APIVersion` supplied through `HatVRAPI_Initialize` and `HatVRAPI_StateChanged`.
+
+Existing API behavior will be kept compatible where practical. New functionality may be exposed through later API versions or additional capabilities.
