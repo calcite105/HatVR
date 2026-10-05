@@ -1,137 +1,116 @@
 # HatVR
 
-HatVR is a WIP VR mod/conversion for A Hat in Time.
 
-The goal is to get A Hat in Time properly running in VR while keeping the game itself as unchanged as possible, allowing existing levels and mods to continue working normally. HatVR supports stereoscopic rendering and 6DOF head tracking through OpenXR, and the game can still be played with a normal controller.
+HatVR is a VR mod/conversion for A Hat in Time, built around playing the original game in VR without changing what it is. It supports stereoscopic rendering, 6DOF head tracking through OpenXR, normal controllers and VR controllers, an in-headset settings menu, Theater Mode, upscaling, and an experimental first person mode using the actual player model as a VR avatar.
 
-First person VR and VR controller support are also being worked on, although both are still experimental.
+Third person is the main way to play and is what I'd recommend for playing through the game. First person is there if you want to mess around with it, but it's much more experimental.
 
-> **Warning**
+> **Before Playing**
 >
-> HatVR is still experimental and in active development. Expect bugs, visual issues, broken camera sequences, and possible crashes.
+> HatVR is still experimental. There are visual issues, camera sequences that don't always translate well to VR, and some things that may render incorrectly in one eye. I also wouldn't recommend using HatVR for your first playthrough of A Hat in Time.
+>
+> HatVR relies on reverse engineering parts of the game, so a game update can potentially break it. If A Hat in Time updates and HatVR suddenly stops working, check for a newer version.
 
 ## Features
 
-* Stereoscopic VR rendering
-* 6DOF head tracking
-* OpenXR support
-* Support for playing with a standard controller
-* Experimental VR controller support
-* Experimental first person mode with an avatar system using the player model for VR arms
-* In-headset HatVR menu
-* Stereoscopic Theater Mode for cutscenes and playing on a screen
-* Designed to remain compatible with existing A Hat in Time levels and mods
-
-## Requirements
-
-* Windows
-
-  * HatVR may work on Linux, but I haven't tested it.
-* A copy of A Hat in Time
-* An OpenXR-compatible headset
-* A controller is currently recommended
+* Stereoscopic VR rendering and 6DOF head tracking through OpenXR
+* Third person VR with normal controller support
+* VR controller support, haptics and optional motion controls
+* Experimental first person mode with a player-model VR avatar
+* In-headset settings menu and adjustable VR HUD
+* Stereoscopic Theater Mode with automatic cutscene switching
+* Desktop spectator view
+* NIS and FSR 1 upscaling
+* PlayStation and Nintendo Switch controller icons (the default Xbox icons have rendering issues)
+* Compatibility with existing levels and mods
 
 ## Setup
 
-HatVR currently uses DXVK and Vulkan for its VR rendering path.
+### Requirements
 
-1. Set A Hat in Time's Graphics API to Vulkan in the game's settings. While HatVR still has DX9 support left over from prototyping, it will have worse performance than Vulkan.
-2. Download the latest HatVR release.
-3. Open your A Hat in Time installation folder.
-4. Go to `HatinTime\Binaries\Win64`.
-5. Place the HatVR files from the release into the `Win64` folder.
-6. Start SteamVR or your preferred OpenXR runtime.
-7. Launch A Hat in Time normally.
+* Windows
 
-HatVR should start automatically with the game.
+  * Linux may work, but I haven't tested it.
+* A Hat in Time
+* An OpenXR-compatible headset and runtime
+* A normal controller or supported VR controllers
 
-To uninstall HatVR, remove the HatVR files from the `Win64` folder.
+Set A Hat in Time's **Graphics API to Vulkan. Do not use DirectX 9 with HatVR.**
 
-## RAM Usage
+HatVR uses the game's DXVK/Vulkan rendering path. The version of DXVK included with the game may work, but I recommend updating the game's DXVK to **DXVK 3.1.1** before using HatVR.
 
-Please note that this game just eats up RAM.
+Download HatVR and place the release files in `HatinTime\Binaries\Win64`. Start SteamVR or your preferred OpenXR runtime and then launch the game normally.
 
-I highly recommend replacing the game's `dxvk.dll` with the latest version of DXVK. While it won't stop high RAM usage completely, in my testing it makes the issue less common and can be the difference between something like 16 GB of RAM being used and around 11 GB being used.
+HatVR should start automatically. A message in the headset will tell you how to open the HatVR menu, and settings are saved to `HatVR.ini`. If OpenXR isn't available, A Hat in Time can still start normally in flatscreen without HatVR's VR gameplay changes being applied. HatVR also stays inactive in `HatinTimeEditor.exe`, so it shouldn't interfere with the Modding Tools.
 
-This is still something I'm looking into, but at the moment it seems to mostly be an issue with the game itself rather than HatVR.
+To uninstall HatVR, remove its files from the `Win64` folder.
 
-## Performance
+## Using HatVR
 
-Performance is still something I'm working on, although at this point the game is very playable for me.
+Double-tap **Y / Triangle** on a controller to open the HatVR menu. A single press still opens A Hat in Time's normal menu. The HatVR menu can currently only be opened using a controller or VR controller, not the keyboard or mouse.
 
-HatVR currently uses DXVK and Vulkan to transfer the game to OpenXR almost entirely on the GPU. Earlier versions had to copy the game through the CPU, which worked, but had noticeably worse performance and latency.
+Most things can be changed from inside the headset, including the renderer, first person, Theater Mode, controls, HUD, spectator view and upscaling.
 
-That being said, A Hat in Time will probably always be a bit hard to run in VR. The game isn't particularly difficult to run at something like 1080p 60 FPS, but once you start asking for higher resolutions and framerates it can get surprisingly demanding, and unfortunately VR asks for both.
+### Rendering
 
-Your experience is obviously going to depend on your headset, resolution and hardware, so I'd like to hear how it runs on other systems.
+HatVR has two main stereo rendering methods because neither works perfectly with everything in the game.
 
-## VR Controllers
+**Stereo** is the default and uses a method based around A Hat in Time's own split-screen rendering. Most of the game works well with it, but some objects and effects can occasionally render incorrectly or disappear in the right eye.
 
-HatVR has experimental support for using normal VR controllers to play the game.
+**Synchronized Sequential** renders the eyes separately from the same game state and can fix things that don't render correctly in Stereo, including some cutscenes. It has its own tradeoffs, but if something is clearly broken in one eye, Sequential is the first thing I'd try.
 
-The controllers are mapped into the game's existing controller input, meaning the game still receives mostly normal gamepad controls rather than requiring special support from A Hat in Time itself.
+Ambient Occlusion can look wrong in Stereo on some headsets. If that happens, turn **Ambient Occlusion off**.
 
-Basic buttons, triggers, sticks and other controller inputs are supported. HatVR also tracks the physical position of the controllers for the experimental player avatar.
+### Performance and Upscaling
 
-There is also an experimental motion attack. Swinging the right controller can trigger Hat Kid's normal attack.
+A Hat in Time isn't normally a very demanding game, but its rendering pipeline wasn't built around stereo rendering, and VR also asks for higher resolutions and framerates than the game would normally run at. Performance will depend on the level, headset resolution, refresh rate and hardware.
 
-VR controller support is still being worked on, so using a standard controller may currently give you a more consistent experience.
+HatVR includes **NVIDIA Image Scaling (NIS)** and **AMD FidelityFX Super Resolution 1 (FSR 1)**. These upscale the finished game image before it's sent to OpenXR, so you can run A Hat in Time at a lower resolution while using a larger VR output. For example, +100% Output Upscale can turn a 1440p game image into a 2880p OpenXR output without changing the resolution the game itself renders at.
 
-## HatVR Menu
+If you're running close to your system's memory limit, having a few GB of page file or swap space available is also a good idea.
 
-HatVR has a basic menu that can be opened from a VR controller.
+### VR Controllers and First Person
 
-At the moment the menu is mostly being used for VR-specific options rather than replacing the game's normal menus.
+VR controller input is mapped into A Hat in Time's existing controller controls, and normal controller vibration is sent back through OpenXR as haptics. **Umbrella Motion Controls** can optionally let you attack by swinging the right controller.
 
-One of the current options is **Theater Mode**, which displays the game on a fixed stereo screen in front of you instead of using the normal immersive VR camera. This can be useful for parts of the game that don't behave well in full VR.
+**Right-Hand Hookshot** lets you hold the right grip and use the right trigger for the Hookshot. This takes over the normal right grip/R input while enabled, so it can interfere with menus or anything else that expects that button.
 
-The menu and its controls are still a work in progress.
+First Person uses the actual player model as a VR avatar rather than simply putting the camera inside the character's head. The headset controls the head/body position while the VR controllers drive the arms and the game continues handling the rest of the character's animation.
 
-## First Person
+It's very experimental, different characters, outfits, and animations can behave differently, and plenty of camera sequences weren't made to be viewed this way. **Third person is still the recommended way to play through the game.**
 
-A custom first person mode is currently being worked on.
+### Theater Mode
 
-The goal is not just to move the camera into Hat Kid's head, but to eventually make the normal player model work as a usable VR avatar. The current implementation already contains experimental head and arm positioning using the headset and VR controllers, but this system is still heavily in development and isn't something I'd consider finished yet.
+Theater Mode displays the game on a fixed stereoscopic screen instead of putting the game's camera directly in VR. HatVR can automatically switch to it during certain cutscenes and return to normal VR afterward, or you can turn it on manually.
 
-The normal third person camera is still the main way I recommend playing HatVR right now.
+### PSVR2
 
-## To-do
+HatVR has optional PSVR2-specific features through **PSVR2 Toolkit**, including headset vibration, an adaptive trigger effect for Right-Hand Hookshot, and eye tracking for choosing directions in the Hat Wheel. Physical right-stick input takes priority over eye tracking.
 
-do this later!
+**HMD Rumble is experimental and disabled by default.** It should only be enabled when using a PSVR2. Enabling it with another headset can cause unnecessary stalls while HatVR attempts to initialize PSVR2 Toolkit.
 
-## Current Issues
+## Known Issues
 
-HatVR is still a work in progress, and there are plenty of things that aren't completely solved yet.
+* The HatVR menu currently needs to be opened with a normal controller or VR controller. There isn't a keyboard or mouse shortcut for it yet.
+* Some objects and effects can render incorrectly or disappear in one eye in Stereo. Try Sequential when this happens.
+* Some cutscenes can have one-eye rendering problems in Stereo, and Sequential can help with some of them.
+* Ambient Occlusion can look wrong in Stereo on some headsets. Turning it off is currently the best workaround.
+* Some scripted cameras and cutscenes can still behave strangely in VR.
+* First Person and the VR avatar are experimental, especially with different or modded player models. Your fingers may randomly distort then quickly go back to normal for example.
+* Looking around freely can occasionally reveal things the original camera wasn't meant to show.
 
-* Some UI elements may look or behave incorrectly in VR.
-* Some cutscenes and scripted camera sequences may not work correctly. For example, Down with the Mafia's boss fight locks the camera.
-* First person mode and the VR avatar are still experimental.
-* Performance can vary quite a bit depending on the area, headset resolution and hardware. I'm currently looking into AFR.
-* A Hat in Time loves RAM.
-* Some parts of the game were never designed with a freely moving VR camera in mind, so expect to sometimes see things you normally weren't supposed to see.
-
-If you find a bug, including one that isn't listed here, feel free to open an issue.
-
-## Development
-
-HatVR began as an experiment to see how far I could push A Hat in Time into VR before spiraling into a full-on mod.
-
-A lot of HatVR is still active reverse engineering, especially around the camera, UI and player avatar. Because of that, some of the source is deliberately kept together in modules that share the same translation unit rather than being split into a cleaner architecture while those systems are still changing constantly.
-
-The source is available both so people can see exactly what the DLL is doing and so anyone interested can experiment with or improve it.
+If you run into something that isn't covered here, feel free to report it.
 
 ## Credits
 
-**[BOTW BetterVR](https://github.com/Crementif/BotW-BetterVR)**. HatVR's experimental first person avatar solution and weapon swinging were heavily based around ideas from its implementation, since both projects are dealing with turning third person games into something that can work from a first person VR perspective, and I already knew that mod's solution worked well.
+**BOTW BetterVR** — Used as a reference while developing the experimental first person avatar and weapon swinging.
 
-**[BL1GOTYVR](https://github.com/Mastersellz/BL1GOTYVR)**. Borderlands 1 also runs on Unreal Engine 3, and that project was a very useful reference later in HatVR's development once we got past prototyping.
+**BL1GOTYVR** — A useful reference while working with DXVK/Vulkan and Unreal Engine 3's rendering behavior.
 
-**First Person Camera Badge**. Used as a basis for our custom first person mode.
+**First Person Camera Badge** — Used as a reference for our first person implementation.
 
-HatVR also uses:
+HatVR uses **MinHook**, the **OpenXR SDK**, **DXVK**, **Dear ImGui**, **AMD FidelityFX Super Resolution 1**, and **NVIDIA Image Scaling**.
 
-* **MinHook** by Tsuda Kageyu and its contributors
-* **OpenXR SDK** by the Khronos Group
-* **DXVK**
+The full HatVR source is available with the project.
 
 A Hat in Time is owned by Gears for Breakfast. HatVR is an unofficial project and is not affiliated with or endorsed by Gears for Breakfast.
