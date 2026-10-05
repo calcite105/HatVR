@@ -68,7 +68,7 @@ Ambient Occlusion can look wrong on some headsets. If that happens, turn **Ambie
 
 ### Performance and Upscaling
 
-A Hat in Time isn't normally a very demanding game, but its rendering pipeline wasn't built around stereo rendering, and VR also asks for higher resolutions and framerates than the game would normally run at. Performance will depend on the level, headset resolution, refresh rate and hardware.
+A Hat in Time isn't normally a very demanding game, but its rendering pipeline wasn't built around stereo rendering, and VR also asks for higher resolutions and framerates than the game would normally run at. Performance will depend on the level, headset resolution, refresh rate and hardware. If you're on a Quest, using VDXR may help performance. A cheaper stereo mode will be looked into in the future, but expect it to be the least accurate if it's added.
 
 HatVR includes **NVIDIA Image Scaling (NIS)** and **AMD FidelityFX Super Resolution 1 (FSR 1)**. These upscale the finished game image before it's sent to OpenXR, so you can run A Hat in Time at a lower resolution while using a larger VR output. For example, +100% Output Upscale can turn a 1440p game image into a 2880p OpenXR output without changing the resolution the game itself renders at.
 
