@@ -92,6 +92,7 @@ HatVR has optional PSVR2-specific features through **PSVR2 Toolkit**, including 
 ## Known Issues
 
 * The HatVR menu currently needs to be opened with a normal controller or VR controller. There isn't a keyboard or mouse shortcut for it yet.
+* Mouse input doesn't work very well in VR since it doesn't compensate for the much larger UI resolution.
 * Some objects and effects can render incorrectly or disappear in one eye in Stereo. Try Sequential when this happens.
 * Some cutscenes can have one-eye rendering problems in Stereo, and Sequential can help with some of them.
 * Ambient Occlusion can look wrong in Stereo on some headsets. Turning it off is currently the best workaround.
