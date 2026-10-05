@@ -1,6 +1,10 @@
 # HatVR
-<img width="800" height="450" alt="ezgif com-optimize (4)" src="https://github.com/user-attachments/assets/2f2cb980-3900-409f-ab2f-c783a330f79d" />
 
+<p align="center">
+  <img width="800" height="450" alt="HatVR" src="https://github.com/user-attachments/assets/2f2cb980-3900-409f-ab2f-c783a330f79d" />
+</p>
+
+## About
 
 HatVR is a VR mod for A Hat in Time, built around playing the original game in VR without changing what it is. It supports stereoscopic rendering, 6DOF head tracking through OpenXR, normal controllers and VR controllers, an in-headset settings menu, Theater Mode, upscaling, and an experimental first person mode using the actual player model as a VR avatar.
 
