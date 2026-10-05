@@ -167,9 +167,11 @@ static void LoadHatVrConfig()
     const DWORD attrs = GetFileAttributesA(g_hatVrConfigPath);
     if (attrs == INVALID_FILE_ATTRIBUTES)
     {
+        // first launch still needs the same renderer setup as later launches.
+        // SaveHatVrConfig writes the compiled defaults, but it does not apply
+        // the renderer's startup state by itself.
         SaveHatVrConfig();
         LogCategory("CONFIG", "Created %s with default settings", g_hatVrConfigPath);
-        return;
     }
 
     const int stereoMode = HatVrReadStereoModeCompat();
