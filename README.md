@@ -59,7 +59,7 @@ HatVR has two main stereo rendering methods because neither works perfectly with
 
 **Synchronized Sequential** renders the eyes separately from the same game state and can fix things that don't render correctly in Stereo, including some cutscenes. It has its own tradeoffs, but if something is clearly broken in one eye, Sequential is the first thing I'd try.
 
-Ambient Occlusion can look wrong in Stereo on some headsets. If that happens, turn **Ambient Occlusion off**.
+Ambient Occlusion can look wrong on some headsets. If that happens, turn **Ambient Occlusion off**.
 
 ### Performance and Upscaling
 
