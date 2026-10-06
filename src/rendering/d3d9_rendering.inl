@@ -600,24 +600,52 @@
         {
             // stereo and sequential both render a wider symmetric horizontal
             // frustum and crop it to the runtime eye during submission.
+            // Keep the last valid runtime-FOV crop for each eye. Present can
+            // occasionally arrive while both XR view-valid flags are transiently
+            // false (scene/camera transitions are the common case). Previously
+            // that made this function return without cropping, so one desktop
+            // frame exposed the full wide render envelope and looked horizontally
+            // squashed. The projection itself has not changed, so retain its last
+            // sane normalized crop until a newer valid XR view replaces it.
+            static float s_runtimeCropOffsetX[2] = { 0.0f, 0.0f };
+            static float s_runtimeCropScaleX[2] = { 1.0f, 1.0f };
+            static bool s_runtimeCropValid[2] = { false, false };
+
             auto cropEyeToRuntimeFov = [&](RECT& r, int eye)
             {
+                eye = eye ? 1 : 0;
                 const XrView* pv = g_xrViewsValidThisFrame
                     ? g_xrViews
                     : (g_renderPoseSnapshotValid ? g_renderPoseSnapshotViews : nullptr);
-                if (!pv) return;
 
-                const XrFovf& fov = pv[eye ? 1 : 0].fov;
-                const float tanL = tanf(fov.angleLeft);
-                const float tanR = tanf(fov.angleRight);
-                const float sourceHalfX = (std::max)(fabsf(tanL), fabsf(tanR));
-                if (sourceHalfX <= 0.0001f) return;
+                if (pv)
+                {
+                    const XrFovf& fov = pv[eye].fov;
+                    const float tanL = tanf(fov.angleLeft);
+                    const float tanR = tanf(fov.angleRight);
+                    const float sourceHalfX = (std::max)(fabsf(tanL), fabsf(tanR));
+                    if (sourceHalfX > 0.0001f)
+                    {
+                        const float scaleX = (tanR - tanL) / (2.0f * sourceHalfX);
+                        const float offsetX = (tanL + sourceHalfX) / (2.0f * sourceHalfX);
+                        if (std::isfinite(scaleX) && std::isfinite(offsetX) &&
+                            scaleX > 0.0f && scaleX <= 1.0001f &&
+                            offsetX >= -0.0001f && offsetX < 1.0f &&
+                            offsetX + scaleX <= 1.0001f)
+                        {
+                            s_runtimeCropOffsetX[eye] = offsetX;
+                            s_runtimeCropScaleX[eye] = scaleX;
+                            s_runtimeCropValid[eye] = true;
+                        }
+                    }
+                }
 
-                const float scaleX = (tanR - tanL) / (2.0f * sourceHalfX);
-                const float offsetX = (tanL + sourceHalfX) / (2.0f * sourceHalfX);
+                if (!s_runtimeCropValid[eye]) return;
+
                 const LONG w = r.right - r.left;
                 if (w <= 1) return;
-
+                const float offsetX = s_runtimeCropOffsetX[eye];
+                const float scaleX = s_runtimeCropScaleX[eye];
                 LONG x0 = r.left + (LONG)floorf(offsetX * (float)w);
                 LONG x1 = r.left + (LONG)ceilf((offsetX + scaleX) * (float)w);
                 x0 = (std::max)(r.left, (std::min)(x0, r.right - 1));
