@@ -87,7 +87,10 @@
         IDirect3DDevice9* device,
         const D3DSURFACE_DESC& desc)
     {
-        const UINT eyeWidth = (std::max)(1u, desc.Width / 2u);
+        // NewSequentialStereo captures a complete eye-sized frame after each scene command.
+        // All other renderers use the original half-of-SBS allocation.
+        const UINT eyeWidth = (std::max)(1u,
+            g_newSequentialStereoEnabled ? desc.Width : desc.Width / 2u);
         const UINT eyeHeight = desc.Height;
 
         // native Stereo's direct-SBS fast path deliberately aliases both
@@ -180,11 +183,143 @@
         return true;
     }
 
+    // NEW_SEQUENTIAL_STEREO-FULLFRAME-EXPERIMENT: capture completed scene commands per eye,
+    // not two halves of one finished SBS render target. This is intentionally
+    // restricted to NewSequentialStereo mode. D3D command execution order keeps the copy
+    // after this scene renderer's queued draws and before the next one.
+    static volatile LONG64 g_newSequentialStereoFullFrameLeftCaptures = 0;
+    static volatile LONG64 g_newSequentialStereoFullFrameRightCaptures = 0;
+    static LONG64 g_newSequentialStereoFullFrameConsumedLeft = 0;
+    static LONG64 g_newSequentialStereoFullFrameConsumedRight = 0;
+    // Each eye is stamped at its completed scene command, NOT at Present.
+    // Counter increments alone cannot distinguish a matching pair from two
+    // separately captured frames. revision makes the multivalue stamp readable
+    // without ever accepting a partially published producer identity.
+    struct NewSequentialStereoEyeCaptureStamp
+    {
+        volatile LONG64 revision = 0;
+        volatile LONG64 captureNumber = 0;
+        volatile LONG64 poseSerial = 0;
+        volatile LONG64 presentAtProduce = 0;
+    };
+    static NewSequentialStereoEyeCaptureStamp g_newSequentialStereoEyeStamp[2] = {};
+    static bool g_newSequentialStereoNewPairThisPresent = false;
+
+    struct NewSequentialStereoEyeCaptureSnapshot
+    {
+        LONG64 captureNumber = 0;
+        unsigned long long poseSerial = 0;
+        unsigned long long presentAtProduce = 0;
+    };
+    static bool ReadNewSequentialStereoEyeCapture(int eye, NewSequentialStereoEyeCaptureSnapshot& out)
+    {
+        NewSequentialStereoEyeCaptureStamp& stamp = g_newSequentialStereoEyeStamp[eye];
+        const LONG64 before = InterlockedCompareExchange64(
+            &stamp.revision, 0, 0);
+        if (before & 1) return false;
+        out.captureNumber = InterlockedCompareExchange64(
+            &stamp.captureNumber, 0, 0);
+        out.poseSerial = (unsigned long long)InterlockedCompareExchange64(
+            &stamp.poseSerial, 0, 0);
+        out.presentAtProduce = (unsigned long long)InterlockedCompareExchange64(
+            &stamp.presentAtProduce, 0, 0);
+        const LONG64 after = InterlockedCompareExchange64(
+            &stamp.revision, 0, 0);
+        return before == after && !(after & 1);
+    }
+    static bool NewSequentialStereoCaptureCompleteEye(int eye,
+        unsigned long long poseSerial, unsigned long long presentAtProduce)
+    {
+        if (!g_newSequentialStereoEnabled || !g_nativeVrResolutionEnabled ||
+            !g_nativeVrColorSurface || (eye != 0 && eye != 1)) return false;
+        IDirect3DDevice9* dev = nullptr;
+        if (FAILED(g_nativeVrColorSurface->GetDevice(&dev)) || !dev) return false;
+        D3DSURFACE_DESC desc{};
+        bool ok = false;
+        if (SUCCEEDED(g_nativeVrColorSurface->GetDesc(&desc)) &&
+            desc.Width >= 2 && desc.Height &&
+            // Do not silently resize a full SBS render into the retained eye.
+            // It should be a same-resolution GPU transfer in NewSequentialStereo mode.
+            desc.Width == g_xrRuntimeEyeWidth &&
+            desc.Height == g_xrRuntimeEyeHeight &&
+            EnsureAlternatingStereoCopies(dev, desc))
+        {
+            IDirect3DTexture9* tex = eye ? g_rightEyeCopy : g_leftEyeCopy;
+            IDirect3DSurface9* dest = nullptr;
+            if (tex && SUCCEEDED(tex->GetSurfaceLevel(0, &dest)) && dest)
+            {
+                // Same-size GPU copy: no downscale/filter stage.  A true
+                // zero-copy path requires render-target ownership changes.
+                const HRESULT hr = dev->StretchRect(g_nativeVrColorSurface,
+                    nullptr, dest, nullptr, D3DTEXF_NONE);
+                ok = SUCCEEDED(hr);
+                dest->Release();
+                if (ok)
+                {
+                    NewSequentialStereoEyeCaptureStamp& stamp = g_newSequentialStereoEyeStamp[eye];
+                    InterlockedIncrement64(&stamp.revision); // odd: publishing
+                    InterlockedExchange64(&stamp.poseSerial, (LONG64)poseSerial);
+                    InterlockedExchange64(&stamp.presentAtProduce,
+                        (LONG64)presentAtProduce);
+                    const LONG64 count = eye
+                        ? InterlockedIncrement64(&g_newSequentialStereoFullFrameRightCaptures)
+                        : InterlockedIncrement64(&g_newSequentialStereoFullFrameLeftCaptures);
+                    InterlockedExchange64(&stamp.captureNumber, count);
+                    InterlockedIncrement64(&stamp.revision); // even: published
+                }
+                static LONG64 attempts = 0;
+                const LONG64 n = InterlockedIncrement64(&attempts);
+                if (!ok || (g_debugToolsEnabled && (n <= 32 || (n % 600) == 0)))
+                    DxvkPathTrace("NEW_SEQUENTIAL_STEREO_FULLFRAME eye=%d ok=%d hr=0x%08X source=%ux%u dest=%ux%u count=%lld",
+                        eye, ok?1:0, (unsigned)hr, desc.Width, desc.Height,
+                        g_stereoCopyWidth, g_stereoCopyHeight, (long long)n);
+            }
+        }
+        dev->Release();
+        return ok;
+    }
+
+    // Standard Stereo: accepting an SBS copy is not proof that UE3 executed a
+    // new scene. Bind each same-tick pair to a fresh executed producer and a
+    // still-resident OpenXR pose, analogous to Recommended's capture guard.
+    // Only Standard Stereo uses this guard; other renderers retain their paths.
+    static volatile LONG64 g_standardStereoLastAcceptedProducer = 0;
+    static bool StandardStereoFreshProducer(unsigned long long& poseOut,
+                                            unsigned long long& producerOut)
+    {
+        const unsigned long long lastAcceptedProducer = (unsigned long long)
+            InterlockedCompareExchange64(&g_standardStereoLastAcceptedProducer, 0, 0);
+        // Read one consistent tuple that was published AFTER Execute completed.
+        // Unlike the shared g_lastExecutedScene* values, this marker is never
+        // advanced when a scene command merely begins executing.
+        const StandardStereoCompletedExecution completed = ReadStandardStereoCompletedExecution();
+        const unsigned long long producer = completed.producerSerial;
+        const unsigned long long pose = completed.poseSerial;
+        const unsigned long long producedPresent = completed.presentAtProduce;
+        const unsigned long long present = (unsigned long long)g_presentFrameNumber;
+        const RenderPoseHistorySlot& history = g_renderPoseHistory[pose & 63ULL];
+        const bool valid = producer != 0 && producer != lastAcceptedProducer &&
+            pose != 0 && history.serial == pose && history.capturedAtMs != 0 &&
+            GetTickCount64() >= history.capturedAtMs &&
+            GetTickCount64() - history.capturedAtMs <= 250ULL &&
+            present >= producedPresent && present - producedPresent <= 4ULL;
+        if (!valid) return false;
+        poseOut = pose;
+        producerOut = producer;
+        return true;
+    }
+    static void StandardStereoConsumeProducer(unsigned long long producer)
+    {
+        // The accepted serial is kept in a single shared slot below. This
+        // function exists to keep the guard's state local to Standard Stereo.
+        InterlockedExchange64(&g_standardStereoLastAcceptedProducer, (LONG64)producer);
+    }
+
     static void CaptureAndDrawAlternatingStereoSBS(IDirect3DDevice9* device)
     {
-        // the generation represent a COMPLETE stereo pixel pair and stamped the
-        // SBS accidentally regressed that rule when the StretchRect split was
-        // removed.
+        // Present publishes at most one genuinely matched NewSequentialStereo pair. A miss
+        // MUST NOT cause another copy of stale D3D9 eye textures to OpenXR.
+        g_newSequentialStereoNewPairThisPresent = false;
 
         // AFR compatibility path. One UE3 view is rendered per frame into the
         // selected SBS half; retain the previous opposite eye in dedicated copies.
@@ -225,6 +360,67 @@
                 }
                 if (dst) dst->Release();
             }
+        }
+
+        // NewSequentialStereo already captured each finished scene command into its eye
+        // texture. Pair by immutable producer identity, never by two unrelated
+        // monotonic counters or the mutable last-executed renderer pose.
+        if (g_newSequentialStereoEnabled && g_v138SameTickAfrActive)
+        {
+            NewSequentialStereoEyeCaptureSnapshot left{}, right{};
+            const bool stampsOk = ReadNewSequentialStereoEyeCapture(0, left) &&
+                ReadNewSequentialStereoEyeCapture(1, right);
+            const unsigned long long presentNow =
+                (unsigned long long)g_presentFrameNumber;
+            const bool idsMatch = stampsOk && left.poseSerial != 0 &&
+                left.poseSerial == right.poseSerial &&
+                left.presentAtProduce == right.presentAtProduce;
+            // Only accept current/recent UE3 scenes. A delayed command from
+            // seconds ago must not become a fresh VR frame after a stall.
+            const bool recent = idsMatch && presentNow >= left.presentAtProduce &&
+                (presentNow - left.presentAtProduce) <= 4ULL;
+            const RenderPoseHistorySlot& history =
+                g_renderPoseHistory[left.poseSerial & 63ULL];
+            // If OpenXR's render pose has fallen out of the pose history (or is
+            // too old), the runtime can reproject its last submitted eye pair.
+            const bool poseValid = recent &&
+                history.serial == left.poseSerial &&
+                history.capturedAtMs != 0 &&
+                GetTickCount64() - history.capturedAtMs <= 250ULL;
+            const bool newPair = poseValid &&
+                left.captureNumber > g_newSequentialStereoFullFrameConsumedLeft &&
+                right.captureNumber > g_newSequentialStereoFullFrameConsumedRight;
+            if (newPair)
+            {
+                g_newSequentialStereoFullFrameConsumedLeft = left.captureNumber;
+                g_newSequentialStereoFullFrameConsumedRight = right.captureNumber;
+                g_haveLeftEye = true;
+                g_haveRightEye = true;
+                InterlockedExchange64(&g_capturedStereoPoseSerial,
+                    (LONG64)left.poseSerial);
+                InterlockedIncrement64(&g_stereoCaptureGeneration);
+                g_newSequentialStereoNewPairThisPresent = true;
+            }
+            else
+            {
+                // Preserve the last *OpenXR* images, not mutable D3D9 captures.
+                // Present will end the OpenXR frame with its previous released
+                // swapchain images instead of copying incomplete eye textures.
+                static unsigned int misses = 0;
+                if (misses++ < 20 || (misses % 600) == 0)
+                    DxvkPathTrace("NEW_SEQUENTIAL_STEREO_PAIR skip stamps=%d match=%d recent=%d pose=%d L=%lld(%llu/%llu) R=%lld(%llu/%llu) used=%lld/%lld now=%llu",
+                        stampsOk ? 1 : 0, idsMatch ? 1 : 0,
+                        recent ? 1 : 0, poseValid ? 1 : 0,
+                        (long long)left.captureNumber, left.poseSerial,
+                        left.presentAtProduce,
+                        (long long)right.captureNumber, right.poseSerial,
+                        right.presentAtProduce,
+                        (long long)g_newSequentialStereoFullFrameConsumedLeft,
+                        (long long)g_newSequentialStereoFullFrameConsumedRight,
+                        presentNow);
+            }
+            g_renderRightEye = false;
+            return;
         }
 
         // SPLIT-AFR-1:
@@ -286,12 +482,9 @@
 
                 if (leftOk && rightOk)
                 {
-                    const unsigned long long capturedPose =
-                        (unsigned long long)InterlockedCompareExchange64(
-                            &g_lastExecutedScenePoseSerial, 0, 0);
-
-                    InterlockedExchange64(
-                        &g_capturedStereoPoseSerial, (LONG64)capturedPose);
+                    const unsigned long long capturedPose = (unsigned long long)
+                        InterlockedCompareExchange64(&g_lastExecutedScenePoseSerial, 0, 0);
+                    InterlockedExchange64(&g_capturedStereoPoseSerial, (LONG64)capturedPose);
 
                     const unsigned long long captureGeneration =
                         (unsigned long long)InterlockedIncrement64(
@@ -359,6 +552,21 @@
             return;
         }
 
+        // Standard Stereo is the native dual-CalcSceneView SBS path. The
+        // earlier guard accidentally targeted the non-native AFR branch above;
+        // validate HERE, before splitting its native SBS target.
+        const bool standardStereoMode = g_nativeStereoEnabled && !g_newSequentialStereoEnabled;
+        unsigned long long standardPose = 0;
+        unsigned long long standardProducer = 0;
+        if (standardStereoMode &&
+            !StandardStereoFreshProducer(standardPose, standardProducer))
+        {
+            g_haveLeftEye = false;
+            g_haveRightEye = false;
+            backbuffer->Release();
+            return;
+        }
+
         IDirect3DSurface9* leftSurface = nullptr;
         IDirect3DSurface9* rightSurface = nullptr;
         if (SUCCEEDED(g_leftEyeCopy->GetSurfaceLevel(0, &leftSurface)) &&
@@ -379,10 +587,16 @@
             // renderer pose that actually produced its pixels.
             if (g_haveLeftEye && g_haveRightEye)
             {
-                const unsigned long long capturedPose = (unsigned long long)
-                    InterlockedCompareExchange64(&g_lastExecutedScenePoseSerial, 0, 0);
+                const unsigned long long capturedPose = standardStereoMode
+                    ? standardPose : (unsigned long long)
+                        InterlockedCompareExchange64(&g_lastExecutedScenePoseSerial, 0, 0);
                 InterlockedExchange64(&g_capturedStereoPoseSerial, (LONG64)capturedPose);
                 InterlockedIncrement64(&g_stereoCaptureGeneration);
+                if (standardStereoMode)
+                {
+                    StandardStereoConsumeProducer(standardProducer);
+                    g_newSequentialStereoNewPairThisPresent = true;
+                }
             }
         }
         if (leftSurface) leftSurface->Release();
@@ -400,8 +614,25 @@
         int uiMode,
         IDirect3DTexture9* uiTexture)
     {
-        if (!device || viewMode <= 0 || viewMode > 3 ||
-            !g_leftEyeCopy || !g_rightEyeCopy || !g_stereoCopyWidth || !g_stereoCopyHeight)
+        if (!device || viewMode < 0 || viewMode > 3)
+            return;
+
+        // "Off" means a BLACK desktop window, not a frozen spectator frame.
+        // The game's ordinary backbuffer can retain the previous image when
+        // HatVR stops composing spectator frames, so clear it before Present.
+        // This only touches the desktop backbuffer, never the OpenXR eye images.
+        if (viewMode == 0)
+        {
+            IDirect3DSurface9* desktop = nullptr;
+            if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &desktop)) && desktop)
+            {
+                device->ColorFill(desktop, nullptr, D3DCOLOR_XRGB(0, 0, 0));
+                desktop->Release();
+            }
+            return;
+        }
+
+        if (!g_leftEyeCopy || !g_rightEyeCopy || !g_stereoCopyWidth || !g_stereoCopyHeight)
             return;
 
         IDirect3DSurface9* backbuffer = nullptr;
@@ -753,10 +984,25 @@
             device->SetSamplerState(0,D3DSAMP_MINFILTER,D3DTEXF_LINEAR);
             device->SetSamplerState(0,D3DSAMP_MAGFILTER,D3DTEXF_LINEAR);
             device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+
+            // In the new full-frame renderer, the UI is rasterized into the
+            // TOP 16:9 region of a taller texture. OpenXR already samples only
+            // that region (ScaleFinishedUiToEyeTexture); the desktop overlay
+            // must use the same source crop instead of stretching the whole
+            // texture over the spectator window.
+            float uiVMax = 1.0f;
+            D3DSURFACE_DESC uiDesc{};
+            if (SUCCEEDED(uiTexture->GetLevelDesc(0, &uiDesc)) && uiDesc.Height)
+            {
+                const unsigned int croppedH = NewSequentialStereoCroppedUiHeight(uiDesc.Width, uiDesc.Height);
+                if (croppedH)
+                    uiVMax = float(croppedH) / float(uiDesc.Height);
+            }
+
             struct V { float x,y,z,rhw,u,v; };
             const float w=(float)bb.Width, h=(float)bb.Height;
             V q[4]={{-0.5f,-0.5f,0,1,0,0},{w-0.5f,-0.5f,0,1,1,0},
-                    {-0.5f,h-0.5f,0,1,0,1},{w-0.5f,h-0.5f,0,1,1,1}};
+                    {-0.5f,h-0.5f,0,1,0,uiVMax},{w-0.5f,h-0.5f,0,1,1,uiVMax}};
             device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,q,sizeof(V));
             device->SetTexture(0,nullptr);
             if (state) { state->Apply(); state->Release(); }

@@ -3,7 +3,6 @@
 //
 // HatVR.ini is created on first startup and menu changes are written immediately.
 
-static char g_hatVrConfigPath[MAX_PATH] = {};
 static bool g_hatVrConfigLoaded = false;
 
 static bool HatVrConfigParseBool(const char* text, bool fallback)
@@ -81,6 +80,7 @@ static void HatVrWriteConfigFloat(const char* key, float value)
 //   NativeStereo = later sequential/re-entry experiment
 //   StereoLite   = BL1 principal-view -> renderer-boundary RIGHT clone
 //   AFR          = same-frame AFR path
+//   NewSequentialStereo = experimental isolated complete-draw/per-eye state path
 static int HatVrReadStereoModeCompat()
 {
     char value[32] = {};
@@ -89,16 +89,33 @@ static int HatVrReadStereoModeCompat()
     if (!_stricmp(value, "NativeStereo")) return 0;
     if (!_stricmp(value, "StereoLite"))   return 1;
     if (!_stricmp(value, "AFR"))          return 2;
+    if (!_stricmp(value, "NewSequentialStereo")) return 3;
 
-    // BL1/StereoLite renderer, not to the later sequential NativeStereo mode.
-    return HatVrReadConfigBool("NativeStereo", true) ? 1 : 2;
+    // Missing StereoMode (including new installs) defaults to the 0.20
+    // recommended renderer; legacy explicit settings remain valid above.
+    return 3;
 }
 
 static void HatVrApplyStereoModeCompat(int mode)
 {
-    if (mode < 0 || mode > 2) mode = 1;
+    if (mode < 0 || mode > 3) mode = 1;
+    if (g_newSequentialStereoEnabled != (mode == 3))
+        InterlockedIncrement(&g_newSequentialStereoModeGeneration);
+    g_newSequentialStereoEnabled = (mode == 3);
+    SetNewSequentialStereoUiPixelAspectCorrection(g_newSequentialStereoEnabled &&
+        g_newSequentialStereoUiKeepPixelAspect && !g_newSequentialStereoUiCrop16x9);
+    SetNewSequentialStereoUiCrop16x9(g_newSequentialStereoEnabled && g_newSequentialStereoUiCrop16x9);
 
-    if (mode == 2) // AFR
+    if (mode == 3) // NewSequentialStereo-style re-entry; normal renderer modes untouched
+    {
+        g_nativeStereoEnabled = false;
+        // The optional hybrid borrows normal Sequential's single gameplay
+        // Draw and producer-level second scene while retaining NewSequentialStereo's
+        // full-eye target, independent render histories and GPU capture.
+        g_v26SequentialReentry = !g_newSequentialStereoHybridOneDraw;
+        SetNativeRenderLoopStereoPatch(false);
+    }
+    else if (mode == 2) // AFR
     {
         g_nativeStereoEnabled = false;
         g_v26SequentialReentry = false;
@@ -118,11 +135,39 @@ static void HatVrApplyStereoModeCompat(int mode)
     }
 }
 
+static void HatVrCycleRenderingMode()
+{
+    if (!g_showOtherRenderers) return;
+    const int current = g_newSequentialStereoEnabled ? 0 : (g_nativeStereoEnabled ? 1 : 2);
+    const int next = (current + 1) % 3;
+    HatVrApplyStereoModeCompat(next == 0 ? 3 : (next == 1 ? 1 : 2));
+    SaveHatVrConfig();
+    LogCategory("RENDER", "renderer selection=%s", next == 0 ? "RECOMMENDED" : (next == 1 ? "STANDARD-STEREO" : "LEGACY-SEQUENTIAL"));
+}
+
+static void HatVrToggleOtherRenderers()
+{
+    g_showOtherRenderers = !g_showOtherRenderers;
+    if (!g_showOtherRenderers)
+        HatVrApplyStereoModeCompat(3);
+    SaveHatVrConfig();
+    LogCategory("RENDER", "other renderers %s", g_showOtherRenderers ? "SHOWN" : "HIDDEN (RECOMMENDED)");
+}
+
 static void SaveHatVrConfig()
 {
     if (!HatVrBuildConfigPath()) return;
 
+    // Write the actual active renderer; otherwise the old StereoMode value
+    // overrides changes from the in-headset menu on the next launch.
+    const char* renderer = g_newSequentialStereoEnabled ? "NewSequentialStereo" :
+        (g_nativeStereoEnabled ? (g_v26SequentialReentry ? "NativeStereo" : "StereoLite") : "AFR");
+    WritePrivateProfileStringA("HatVR", "StereoMode", renderer, g_hatVrConfigPath);
     HatVrWriteConfigBool("NativeStereo", g_nativeStereoEnabled);
+    HatVrWriteConfigBool("ShowOtherRenderers", g_showOtherRenderers);
+    HatVrWriteConfigBool("NewSequentialStereoOneDrawHybrid", g_newSequentialStereoHybridOneDraw);
+    HatVrWriteConfigBool("NewSequentialStereoUiCrop16x9", g_newSequentialStereoUiCrop16x9);
+    HatVrWriteConfigBool("DisableMirrorModeInVR", g_vrDisableMirrorMode);
     HatVrWriteConfigBool("FirstPerson", g_firstPersonConfigured);
     HatVrWriteConfigBool("TheaterMode", g_theaterMode);
     HatVrWriteConfigBool("AutoCutsceneTheater", g_autoTheaterCutscenes);
@@ -147,6 +192,12 @@ static void SaveHatVrConfig()
     HatVrWriteConfigBool("PSVR2HmdRumble", g_psvr2HmdRumbleEnabled);
     HatVrWriteConfigBool("PSVR2StrongPhysicalOnly", g_psvr2StrongPhysicalOnly); // legacy
     HatVrWriteConfigBool("PSVR2EyeHatWheel", g_psvr2EyeWheelEnabled);
+    { char v[16] = {}; _snprintf_s(v,sizeof(v),_TRUNCATE,"%d",g_psvr2EyeWheelOffsetX); WritePrivateProfileStringA("HatVR","PSVR2EyeWheelCenterX",v,g_hatVrConfigPath); }
+    { char v[16] = {}; _snprintf_s(v,sizeof(v),_TRUNCATE,"%d",g_psvr2EyeWheelOffsetY); WritePrivateProfileStringA("HatVR","PSVR2EyeWheelCenterY",v,g_hatVrConfigPath); }
+    { char v[16] = {}; _snprintf_s(v,sizeof(v),_TRUNCATE,"%d",g_psvr2EyeWheelStability); WritePrivateProfileStringA("HatVR","PSVR2EyeWheelStability",v,g_hatVrConfigPath); }
+    { char v[16] = {}; _snprintf_s(v,sizeof(v),_TRUNCATE,"%d",g_psvr2EyeWheelDeadzone); WritePrivateProfileStringA("HatVR","PSVR2EyeWheelDeadzone",v,g_hatVrConfigPath); }
+    { char v[16] = {}; _snprintf_s(v,sizeof(v),_TRUNCATE,"%d",g_psvr2EyeWheelRadius); WritePrivateProfileStringA("HatVR","PSVR2EyeWheelRadius",v,g_hatVrConfigPath); }
+    HatVrWriteConfigBool("PSVR2EyeWheelDebugVisuals", g_psvr2EyeWheelDebugVisuals);
     { char v[16] = {}; _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_psvr2HmdRumbleIntensity); WritePrivateProfileStringA("HatVR", "PSVR2HmdRumbleIntensity", v, g_hatVrConfigPath); }
     { char v[16] = {}; _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_psvr2HmdRumbleCurve); WritePrivateProfileStringA("HatVR", "PSVR2HmdRumbleCurve", v, g_hatVrConfigPath); }
     HatVrWriteConfigBool("PSVR2HookshotAdaptiveTrigger", g_psvr2HookshotAdaptiveTrigger);
@@ -174,8 +225,14 @@ static void LoadHatVrConfig()
         LogCategory("CONFIG", "Created %s with default settings", g_hatVrConfigPath);
     }
 
+    // Read before mode selection because NewSequentialStereo's hybrid chooses whether
+    // the second scene is requested at gameplay-Draw or scene-producer level.
+    g_newSequentialStereoHybridOneDraw = HatVrReadConfigBool("NewSequentialStereoOneDrawHybrid", true);
+    g_vrDisableMirrorMode = HatVrReadConfigBool("DisableMirrorModeInVR", true);
     const int stereoMode = HatVrReadStereoModeCompat();
-    HatVrApplyStereoModeCompat(stereoMode);
+    g_showOtherRenderers = HatVrReadConfigBool("ShowOtherRenderers", stereoMode != 3);
+    // A hidden renderer selector must never leave a legacy renderer active.
+    HatVrApplyStereoModeCompat(g_showOtherRenderers ? stereoMode : 3);
     const bool firstPerson =
         HatVrReadConfigBool("FirstPerson", g_fpV1Enabled && g_avV29ProbeEnabled);
     g_theaterMode =
@@ -206,6 +263,18 @@ static void LoadHatVrConfig()
     g_spectatorUiMode = GetPrivateProfileIntA("HatVR", "SpectatorUiMode", g_spectatorUiMode, g_hatVrConfigPath);
     g_spectatorExpandedFov = HatVrReadConfigBool("SpectatorExpandedFov", false);
     g_debugToolsEnabled = GetPrivateProfileIntA("HatVR", "DebugToolsEnabled", 0, g_hatVrConfigPath) != 0;
+    g_newSequentialStereoHudSinglePass = HatVrReadConfigBool("NewSequentialStereoHudSinglePass", true);
+    g_newSequentialStereoLatePromptReplay = HatVrReadConfigBool("NewSequentialStereoLatePromptReplay", true);
+    g_newSequentialStereoPromptPreserveViewport = HatVrReadConfigBool("NewSequentialStereoPromptPreserveViewport", true);
+    g_newSequentialStereoUiKeepPixelAspect = HatVrReadConfigBool("NewSequentialStereoUiKeepPixelAspect", true);
+    g_newSequentialStereoUiCrop16x9 = HatVrReadConfigBool("NewSequentialStereoUiCrop16x9", true);
+    g_sequentialIndependentFvi = HatVrReadConfigBool("SequentialIndependentFvi", false);
+    SetNewSequentialStereoUiPixelAspectCorrection(g_newSequentialStereoEnabled &&
+        g_newSequentialStereoUiKeepPixelAspect && !g_newSequentialStereoUiCrop16x9);
+    SetNewSequentialStereoUiCrop16x9(g_newSequentialStereoEnabled && g_newSequentialStereoUiCrop16x9);
+    LogCategory("RENDER", "NewSequentialStereo one-Draw=%d HUD canonical-pass=%d UI pixel-aspect=%d Sequential independent-FVI=%d",
+        (int)g_newSequentialStereoHybridOneDraw, (int)g_newSequentialStereoHudSinglePass,
+        (int)g_newSequentialStereoUiKeepPixelAspect, (int)g_sequentialIndependentFvi);
     g_hatVrCurseCasualMenuFont =
         HatVrReadConfigBool("CurseCasualMenuFont", true);
     g_hatVrModApiEnabled = HatVrReadConfigBool("ModAPI", false);
@@ -223,6 +292,12 @@ static void LoadHatVrConfig()
         HatVrReadConfigBool("PSVR2StrongPhysicalOnly", g_psvr2StrongPhysicalOnly);
     g_psvr2EyeWheelEnabled =
         HatVrReadConfigBool("PSVR2EyeHatWheel", g_psvr2EyeWheelEnabled);
+    g_psvr2EyeWheelOffsetX = (std::max)(-75, (std::min)(75, static_cast<int>(GetPrivateProfileIntA("HatVR", "PSVR2EyeWheelCenterX", 0, g_hatVrConfigPath))));
+    g_psvr2EyeWheelOffsetY = (std::max)(-75, (std::min)(75, static_cast<int>(GetPrivateProfileIntA("HatVR", "PSVR2EyeWheelCenterY", 0, g_hatVrConfigPath))));
+    g_psvr2EyeWheelStability = (std::max)(0, (std::min)(90, static_cast<int>(GetPrivateProfileIntA("HatVR", "PSVR2EyeWheelStability", 50, g_hatVrConfigPath))));
+    g_psvr2EyeWheelDeadzone = (std::max)(5, (std::min)(40, static_cast<int>(GetPrivateProfileIntA("HatVR", "PSVR2EyeWheelDeadzone", 40, g_hatVrConfigPath))));
+    g_psvr2EyeWheelRadius = (std::max)(10, (std::min)(95, static_cast<int>(GetPrivateProfileIntA("HatVR", "PSVR2EyeWheelRadius", 90, g_hatVrConfigPath))));
+    g_psvr2EyeWheelDebugVisuals = HatVrReadConfigBool("PSVR2EyeWheelDebugVisuals", false);
     g_psvr2HmdRumbleIntensity = GetPrivateProfileIntA("HatVR", "PSVR2HmdRumbleIntensity", g_psvr2HmdRumbleIntensity, g_hatVrConfigPath);
     g_psvr2HmdRumbleCurve = GetPrivateProfileIntA("HatVR", "PSVR2HmdRumbleCurve", g_psvr2HmdRumbleCurve, g_hatVrConfigPath);
     g_psvr2HookshotAdaptiveTrigger = HatVrReadConfigBool("PSVR2HookshotAdaptiveTrigger", g_psvr2HookshotAdaptiveTrigger);

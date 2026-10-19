@@ -137,7 +137,7 @@
             g_motionGoodSinceMs[hand] = 0;
         }
 
-        if (now - g_motionLastLogMs[hand] >= 500) {
+        if (g_debugToolsEnabled && now - g_motionLastLogMs[hand] >= 500) {
             g_motionLastLogMs[hand] = now;
             char line[256]{};
             sprintf_s(line, sizeof(line),
@@ -198,14 +198,16 @@
         info.interactionProfile = profilePath;
         info.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
         info.suggestedBindings = bindings.data();
-        xrSuggestInteractionProfileBindings(g_xrInstance, &info);
+        const XrResult xr = xrSuggestInteractionProfileBindings(g_xrInstance, &info);
+        LogCategory("INPUT", "OpenXR suggested profile %s: result=%d bindings=%u",
+            profile, (int)xr, info.countSuggestedBindings);
     }
 
     // Shared HatVR menu action path. Keyboard, physical XInput pads and OpenXR
     // controllers all feed the same menu state instead of maintaining separate menus.
     static int HatVrMenuPageRows(int page)
     {
-        switch(page){case 0:return 1;case 1:return 12;case 2:return 9;case 3:return 8;case 4:return 3;case 5:return 1;case 6:return 6;default:return 1;}
+        switch(page){case 0:return 1;case 1:return 13;case 2:return 9;case 3:return 8;case 4:return 3;case 5:return 1;case 6:return 13;default:return 1;}
     }
 
     static void HatVrMenuOpenFromInput(const char* source)
@@ -225,9 +227,9 @@
         if(!g_vrMenuOpen) return;
         if(!g_vrMenuInsideCategory)
         {
-            const int pageCount=g_debugToolsEnabled?7:6;
-            if(up) g_vrMenuPage=(g_vrMenuPage+pageCount-1)%pageCount;
-            if(down) g_vrMenuPage=(g_vrMenuPage+1)%pageCount;
+            if (!HatVrMenuPageVisible(g_vrMenuPage)) g_vrMenuPage=1;
+            if(up) g_vrMenuPage=HatVrMenuStepPage(g_vrMenuPage,-1);
+            if(down) g_vrMenuPage=HatVrMenuStepPage(g_vrMenuPage,+1);
             g_vrMenuSelection=0;
             if(accept){ g_vrMenuInsideCategory=true; g_vrMenuSelection=0; }
             if(back) HatVrMenuCloseFromInput("Back");
@@ -235,8 +237,22 @@
         }
         const int rows=HatVrMenuPageRows(g_vrMenuPage);
         if(g_vrMenuSelection<0 || g_vrMenuSelection>=rows) g_vrMenuSelection=0;
-        if(up) g_vrMenuSelection=(g_vrMenuSelection+rows-1)%rows;
-        if(down) g_vrMenuSelection=(g_vrMenuSelection+1)%rows;
+        // Row 2 (Sharper Native Stereo) is hidden until alternative renderers are enabled.
+        // Keep the rest of the menu's stable row IDs; never focus an invisible row.
+        if(g_vrMenuPage==1 && !g_showOtherRenderers && g_vrMenuSelection==2)
+            g_vrMenuSelection=3;
+        if(up)
+        {
+            g_vrMenuSelection=(g_vrMenuSelection+rows-1)%rows;
+            if(g_vrMenuPage==1 && !g_showOtherRenderers && g_vrMenuSelection==2)
+                g_vrMenuSelection=1;
+        }
+        if(down)
+        {
+            g_vrMenuSelection=(g_vrMenuSelection+1)%rows;
+            if(g_vrMenuPage==1 && !g_showOtherRenderers && g_vrMenuSelection==2)
+                g_vrMenuSelection=3;
+        }
         const float dir=right?1.0f:(left?-1.0f:0.0f);
         if(dir!=0.0f)
         {
@@ -245,9 +261,14 @@
             else if(g_vrMenuPage==3 && g_vrMenuSelection==2) g_hatVrHudHeight=(std::max)(-1.00f,(std::min)(1.00f,g_hatVrHudHeight+dir*0.05f));
             else if(g_vrMenuPage==2 && g_vrMenuSelection==5) g_psvr2HmdRumbleIntensity=(std::max)(0,(std::min)(100,g_psvr2HmdRumbleIntensity+(int)dir*5));
             else if(g_vrMenuPage==2 && g_vrMenuSelection==6) g_psvr2HmdRumbleCurve=(g_psvr2HmdRumbleCurve+(dir>0?1:2))%3;
-            else if(g_vrMenuPage==1 && g_vrMenuSelection==9) g_openXrUpscaler=(g_openXrUpscaler==0)?1:0;
-            else if(g_vrMenuPage==1 && g_vrMenuSelection==10) g_openXrUpscalePercent=(std::max)(25,(std::min)(100,g_openXrUpscalePercent+(dir>0?5:-5)));
-            else if(g_vrMenuPage==1 && g_vrMenuSelection==11) g_openXrUpscaleSharpness=(std::max)(0,(std::min)(100,g_openXrUpscaleSharpness+(dir>0?5:-5)));
+            else if(g_vrMenuPage==6 && g_vrMenuSelection==6) g_psvr2EyeWheelOffsetX=(std::max)(-75,(std::min)(75,g_psvr2EyeWheelOffsetX+(int)dir*5));
+            else if(g_vrMenuPage==6 && g_vrMenuSelection==7) g_psvr2EyeWheelOffsetY=(std::max)(-75,(std::min)(75,g_psvr2EyeWheelOffsetY+(int)dir*5));
+            else if(g_vrMenuPage==6 && g_vrMenuSelection==10) g_psvr2EyeWheelStability=(std::max)(0,(std::min)(90,g_psvr2EyeWheelStability+(int)dir*5));
+            else if(g_vrMenuPage==6 && g_vrMenuSelection==8) g_psvr2EyeWheelRadius=(std::max)(10,(std::min)(95,g_psvr2EyeWheelRadius+(int)dir*5));
+            else if(g_vrMenuPage==6 && g_vrMenuSelection==9) g_psvr2EyeWheelDeadzone=(std::max)(5,(std::min)(40,g_psvr2EyeWheelDeadzone+(int)dir*5));
+            else if(g_vrMenuPage==1 && g_vrMenuSelection==10) g_openXrUpscaler=(g_openXrUpscaler==0)?1:0;
+            else if(g_vrMenuPage==1 && g_vrMenuSelection==11) g_openXrUpscalePercent=(std::max)(25,(std::min)(100,g_openXrUpscalePercent+(dir>0?5:-5)));
+            else if(g_vrMenuPage==1 && g_vrMenuSelection==12) g_openXrUpscaleSharpness=(std::max)(0,(std::min)(100,g_openXrUpscaleSharpness+(dir>0?5:-5)));
             SaveHatVrConfig();
         }
         if(accept)
@@ -261,22 +282,25 @@
                 enum HatVrRenderingRow
                 {
                     kRenderingMode = 0,
-                    kSharperNativeStereo = 1,
-                    kFirstPerson = 2,
-                    kModApi = 3,
-                    kDisablePlayerFade = 4,
-                    kTheaterMode = 5,
-                    kAutoTheaterCutscenes = 6,
-                    kOverrideLockedCameras = 7,
-                    kUpscaling = 8,
-                    kUpscaler = 9,
-                    kUpscalePercent = 10,
-                    kUpscaleSharpness = 11
+                    kShowOtherRenderers = 1,
+                    kSharperNativeStereo = 2,
+                    kFirstPerson = 3,
+                    kModApi = 4,
+                    kDisablePlayerFade = 5,
+                    kTheaterMode = 6,
+                    kAutoTheaterCutscenes = 7,
+                    kOverrideLockedCameras = 8,
+                    kUpscaling = 9,
+                    kUpscaler = 10,
+                    kUpscalePercent = 11,
+                    kUpscaleSharpness = 12
                 };
                 switch(g_vrMenuSelection){
-                case kRenderingMode:{const bool requestedStereo=!g_nativeStereoEnabled;if(SetNativeRenderLoopStereoPatch(false))g_nativeStereoEnabled=requestedStereo;SaveHatVrConfig();break;}
+                case kRenderingMode:{HatVrCycleRenderingMode();break;}
+                case kShowOtherRenderers:{HatVrToggleOtherRenderers();break;}
                 case kSharperNativeStereo:
                 {
+                    if (!g_showOtherRenderers) break; // hidden; prevent stale selection toggle
                     // this row was inserted above First Person. Treat activation as terminal:
                     // one Accept press must never continue into an older/stale menu action.
                     g_sharperNativeStereo=!g_sharperNativeStereo;
@@ -302,7 +326,7 @@
                 case 7:g_psvr2HookshotAdaptiveTrigger=!g_psvr2HookshotAdaptiveTrigger;if(!g_psvr2HookshotAdaptiveTrigger)HatVrSetPsvr2RightHookshotTrigger(false);SaveHatVrConfig();break; case 8:g_psvr2EyeWheelEnabled=!g_psvr2EyeWheelEnabled;SaveHatVrConfig();break;}
             else if(g_vrMenuPage==3) switch(g_vrMenuSelection){case 3:g_hatVrHudScale=1.0f;SaveHatVrConfig();break;case 4:g_hatVrHudDistance=0.65f;g_hatVrHudHeight=0.0f;SaveHatVrConfig();break;case 5:g_hatVrHudHeadLocked=!g_hatVrHudHeadLocked;SaveHatVrConfig();break;case 6:g_hatVrCurseCasualMenuFont=!g_hatVrCurseCasualMenuFont;SaveHatVrConfig();break;case 7:g_hatVrHudScale=1.0f;g_hatVrHudDistance=0.65f;g_hatVrHudHeight=0.0f;g_hatVrHudHeadLocked=false;g_hatVrCurseCasualMenuFont=true;SaveHatVrConfig();break;}
             else if(g_vrMenuPage==4){if(g_vrMenuSelection==0){g_spectatorView=(g_spectatorView+1)%4;SaveHatVrConfig();}else if(g_vrMenuSelection==1){g_spectatorUiMode=(g_spectatorUiMode+1)%2;SaveHatVrConfig();}else if(g_vrMenuSelection==2&&!g_sharperNativeStereo){g_spectatorExpandedFov=!g_spectatorExpandedFov;SaveHatVrConfig();}}
-            else if(g_vrMenuPage==6) switch(g_vrMenuSelection){case 0:UiCandidateSelectDelta(-1);break;case 1:UiCandidateSelectDelta(+1);break;case 2:UiCandidateCyclePreview();break;case 3:UiCandidateMarkGame();break;case 4:UiCandidateMarkUi();break;case 5:UiCandidateClearMark();break;}
+            else if(g_vrMenuPage==6) switch(g_vrMenuSelection){case 0:UiCandidateSelectDelta(-1);break;case 1:UiCandidateSelectDelta(+1);break;case 2:UiCandidateCyclePreview();break;case 3:UiCandidateMarkGame();break;case 4:UiCandidateMarkUi();break;case 5:UiCandidateClearMark();break;case 11:g_psvr2EyeWheelDebugVisuals=!g_psvr2EyeWheelDebugVisuals;SaveHatVrConfig();break;case 12:g_psvr2EyeWheelOffsetX=0;g_psvr2EyeWheelOffsetY=0;g_psvr2EyeWheelRadius=90;g_psvr2EyeWheelStability=50;g_psvr2EyeWheelDeadzone=40;SaveHatVrConfig();break;}
         }
         if(back){g_vrMenuInsideCategory=false;g_vrMenuSelection=0;}
     }
@@ -413,6 +437,9 @@
                 }
                 g_physicalStartPending=true; g_physicalStartFirstTapMs=now;
             }
+            // Keep physical Y/Triangle (HV_Y) and every other game button
+            // untouched here. Only Start is intercepted; while normal VR
+            // play locks camera pitch, the original Y action still reaches AHiT.
             if(g_physicalStartPending)
             {
                 state->Gamepad.wButtons &= ~HV_START;
@@ -501,6 +528,9 @@
             return L"Oculus Touch Controller";
         if (strstr(profile, "/valve/index_controller"))
             return L"Valve Index Controller";
+        if (strstr(profile, "/valve/frame_controller_valve") ||
+            strstr(profile, "/valve/frame_controller"))
+            return L"Steam Frame Controller";
         if (strstr(profile, "/microsoft/motion_controller"))
             return L"Windows Mixed Reality Controller";
         if (strstr(profile, "/htc/vive_controller"))
@@ -696,8 +726,20 @@
         g_actionY = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "gamepad_y", "Y");
         g_actionLeftTrigger = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT, "left_trigger", "Left Trigger");
         g_actionRightTrigger = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT, "right_trigger", "Right Trigger");
-        g_actionLeftGrip = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT, "left_grip", "Left Bumper");
-        g_actionRightGrip = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT, "right_grip", "Right Bumper");
+        g_actionLeftGrip = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT, "left_grip", "Left Grip");
+        g_actionRightGrip = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT, "right_grip", "Right Grip");
+        g_actionIndexLeftGripForce = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT,
+            "index_left_force", "Left Index Grip Force");
+        g_actionIndexRightGripForce = CreateHatVrAction(XR_ACTION_TYPE_FLOAT_INPUT,
+            "index_right_force", "Right Index Grip Force");
+        g_actionViveLeftGripClick = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "vive_left_squeeze", "Left Vive Grip Click");
+        g_actionViveRightGripClick = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "vive_right_squeeze", "Right Vive Grip Click");
+        g_actionLeftBumper = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "left_bumper", "Left Bumper");
+        g_actionRightBumper = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT,
+            "right_bumper", "Right Bumper");
         g_actionStart = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "start", "Menu (Hold for Back)");
         g_actionBack = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "back", "Share / Back");
         g_actionLeftStickClick = CreateHatVrAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "left_stick_click", "Left Stick Click / Emote");
@@ -713,7 +755,12 @@
 
         if (g_actionLeftStick == XR_NULL_HANDLE || g_actionRightStick == XR_NULL_HANDLE ||
             g_actionA == XR_NULL_HANDLE || g_actionB == XR_NULL_HANDLE ||
-            g_actionX == XR_NULL_HANDLE || g_actionStart == XR_NULL_HANDLE)
+            g_actionX == XR_NULL_HANDLE || g_actionStart == XR_NULL_HANDLE ||
+            g_actionIndexLeftGripForce == XR_NULL_HANDLE ||
+            g_actionIndexRightGripForce == XR_NULL_HANDLE ||
+            g_actionViveLeftGripClick == XR_NULL_HANDLE ||
+            g_actionViveRightGripClick == XR_NULL_HANDLE ||
+            g_actionLeftBumper == XR_NULL_HANDLE || g_actionRightBumper == XR_NULL_HANDLE)
             return false;
 
         std::vector<XrActionSuggestedBinding> touch;
@@ -746,13 +793,69 @@
         AddBinding(index, g_actionStart, "/user/hand/left/input/b/click");
         AddBinding(index, g_actionLeftTrigger, "/user/hand/left/input/trigger/value");
         AddBinding(index, g_actionRightTrigger, "/user/hand/right/input/trigger/value");
-        AddBinding(index, g_actionLeftGrip, "/user/hand/left/input/squeeze/value");
-        AddBinding(index, g_actionRightGrip, "/user/hand/right/input/squeeze/value");
+        // Index /squeeze/value reports finger curl (including just resting on
+        // the handle). /squeeze/force is the deliberate squeeze pressure.
+        AddBinding(index, g_actionIndexLeftGripForce, "/user/hand/left/input/squeeze/force");
+        AddBinding(index, g_actionIndexRightGripForce, "/user/hand/right/input/squeeze/force");
         AddBinding(index, g_actionLeftStickClick, "/user/hand/left/input/thumbstick/click");
         AddBinding(index, g_actionRightStickClick, "/user/hand/right/input/thumbstick/click");
         AddBinding(index, g_actionHapticLeft, "/user/hand/left/output/haptic");
         AddBinding(index, g_actionHapticRight, "/user/hand/right/output/haptic");
         SuggestControllerProfile("/interaction_profiles/valve/index_controller", index);
+
+        // HTC Vive wands: two trackpads, two triggers, digital grip buttons and
+        // menu buttons. They have no thumbsticks or A/B/X/Y face buttons.
+        std::vector<XrActionSuggestedBinding> vive;
+        AddBinding(vive, gripPoseAction, "/user/hand/left/input/grip/pose");
+        AddBinding(vive, gripPoseAction, "/user/hand/right/input/grip/pose");
+        AddBinding(vive, g_actionLeftStick, "/user/hand/left/input/trackpad");
+        AddBinding(vive, g_actionRightStick, "/user/hand/right/input/trackpad");
+        // Clicking right pad jumps (A); clicking left pad attacks (X).
+        AddBinding(vive, g_actionA, "/user/hand/right/input/trackpad/click");
+        AddBinding(vive, g_actionX, "/user/hand/left/input/trackpad/click");
+        AddBinding(vive, g_actionStart, "/user/hand/left/input/menu/click");
+        AddBinding(vive, g_actionB, "/user/hand/right/input/menu/click");
+        AddBinding(vive, g_actionLeftTrigger, "/user/hand/left/input/trigger/value");
+        AddBinding(vive, g_actionRightTrigger, "/user/hand/right/input/trigger/value");
+        AddBinding(vive, g_actionViveLeftGripClick, "/user/hand/left/input/squeeze/click");
+        AddBinding(vive, g_actionViveRightGripClick, "/user/hand/right/input/squeeze/click");
+        AddBinding(vive, g_actionHapticLeft, "/user/hand/left/output/haptic");
+        AddBinding(vive, g_actionHapticRight, "/user/hand/right/output/haptic");
+        SuggestControllerProfile("/interaction_profiles/htc/vive_controller", vive);
+
+        // Native Steam Frame bindings are exposed only when the instance enables
+        // XR_VALVE_frame_controller_interaction. If absent, SteamVR presents
+        // the controllers as emulated Oculus Touch (handled above).
+        std::vector<XrActionSuggestedBinding> frame;
+        AddBinding(frame, gripPoseAction, "/user/hand/left/input/grip/pose");
+        AddBinding(frame, gripPoseAction, "/user/hand/right/input/grip/pose");
+        AddBinding(frame, g_actionLeftStick, "/user/hand/left/input/thumbstick");
+        AddBinding(frame, g_actionRightStick, "/user/hand/right/input/thumbstick");
+        AddBinding(frame, g_actionA, "/user/hand/right/input/a/click");
+        AddBinding(frame, g_actionB, "/user/hand/right/input/b/click");
+        AddBinding(frame, g_actionX, "/user/hand/right/input/x/click");
+        AddBinding(frame, g_actionY, "/user/hand/right/input/y/click");
+        AddBinding(frame, g_actionDpadUp, "/user/hand/left/input/dpad_up/click");
+        AddBinding(frame, g_actionDpadDown, "/user/hand/left/input/dpad_down/click");
+        AddBinding(frame, g_actionDpadLeft, "/user/hand/left/input/dpad_left/click");
+        AddBinding(frame, g_actionDpadRight, "/user/hand/left/input/dpad_right/click");
+        AddBinding(frame, g_actionStart, "/user/hand/left/input/view/click");
+        AddBinding(frame, g_actionBack, "/user/hand/right/input/menu/click");
+        AddBinding(frame, g_actionLeftBumper, "/user/hand/left/input/bumper/click");
+        AddBinding(frame, g_actionRightBumper, "/user/hand/right/input/bumper/click");
+        AddBinding(frame, g_actionLeftTrigger, "/user/hand/left/input/trigger/value");
+        AddBinding(frame, g_actionRightTrigger, "/user/hand/right/input/trigger/value");
+        AddBinding(frame, g_actionLeftGrip, "/user/hand/left/input/squeeze/value");
+        AddBinding(frame, g_actionRightGrip, "/user/hand/right/input/squeeze/value");
+        AddBinding(frame, g_actionLeftStickClick, "/user/hand/left/input/thumbstick/click");
+        AddBinding(frame, g_actionRightStickClick, "/user/hand/right/input/thumbstick/click");
+        AddBinding(frame, g_actionHapticLeft, "/user/hand/left/output/haptic");
+        AddBinding(frame, g_actionHapticRight, "/user/hand/right/output/haptic");
+        // Only suggest if the extension was enabled by the OpenXR backend.
+        if (g_hatVrFrameControllerExtensionEnabled)
+            SuggestControllerProfile("/interaction_profiles/valve/frame_controller_valve", frame);
+        else
+            LogCategory("INPUT", "Steam Frame native profile unavailable; Oculus Touch emulation remains supported");
 
         g_controllerActionsReady = true;
         DebugLog("MOTION_V4 gamepad actions created on avatar action set\\n");

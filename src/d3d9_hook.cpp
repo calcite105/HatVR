@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <cstring>
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -104,9 +105,21 @@ namespace ahitvr
             allOk ? "ACTIVE" : "PARTIAL");
     }
 
+// Forward declaration: the render-thread hook is included before d3d9_rendering.inl.
+// The implementation lives in rendering/d3d9_rendering.inl.
+static bool NewSequentialStereoCaptureCompleteEye(int eye, unsigned long long poseSerial,
+    unsigned long long presentAtProduce);
+
+// The gameplay Draw hook is included before mirror_mode_compat.inl.
+// Keep only a declaration here; the implementation follows camera_hooks.inl
+// because it depends on the first-person UE3 reflection helpers.
+static void ForceMirrorModeOffForVr(void* viewportClient);
+static void VrMirrorObserveLocalPlayer(void* localPlayer);
+
 #include "core/shared_state.inl"
 #include "include_order/openxr_runtime_order.inl"
 #include "camera/camera_hooks.inl"
+#include "rendering/mirror_mode_compat.inl"
 #include "ui/ui_discovery.inl"
 #include "core/runtime_control.inl"
 #include "rendering/d3d9_rendering.inl"
@@ -117,23 +130,19 @@ namespace ahitvr
 
 bool AttachExistingD3D9Device(IDirect3DDevice9* device)
 {
-    LogCategory("DXVK", "HOTFIX-DIAG A00 AttachExistingD3D9Device FUNCTION ENTRY device=%p", device);
     // Build 25577316: defer the live motion-blur compatibility override.
     // the relocated globals are valid, but mutating them from the DXVK
     // discovery thread during attachment aborts startup on the hotfix build.
 
-    DxvkPathTrace("VKBRIDGE-V5 PHASE5 BUILD-STAMP 2026-09-19D d3d9_hook.cpp ACTIVE");
     DxvkPathTrace("V11 AttachExistingD3D9Device ENTER device=%p", device);
     if (!device)
         return false;
-    LogCategory("DXVK", "HOTFIX-DIAG A01 device non-null; about to QueryInterface DXVK interop");
     // No allocator hooks are installed in this pass.
 
     // device. This is read-only probing; we do not submit to DXVK's queue yet.
     ID3D9VkInteropDeviceHatVR* vkInterop = nullptr;
     const HRESULT interopHr = device->QueryInterface(
         __uuidof(ID3D9VkInteropDeviceHatVR), reinterpret_cast<void**>(&vkInterop));
-    LogCategory("DXVK", "HOTFIX-DIAG A02 QueryInterface returned hr=0x%08X ptr=%p", (unsigned)interopHr, vkInterop);
     DxvkPathTrace("VKBRIDGE-V5 PHASE4A QueryInterface(ID3D9VkInteropDevice) hr=0x%08X ptr=%p",
         (unsigned)interopHr, vkInterop);
     if (SUCCEEDED(interopHr) && vkInterop)
@@ -144,22 +153,16 @@ bool AttachExistingD3D9Device(IDirect3DDevice9* device)
         VkQueue dxvkQueue = VK_NULL_HANDLE;
         uint32_t dxvkQueueIndex = UINT32_MAX;
         uint32_t dxvkQueueFamily = UINT32_MAX;
-        LogCategory("DXVK", "HOTFIX-DIAG A03 about to GetVulkanHandles");
         vkInterop->GetVulkanHandles(&dxvkInstance, &dxvkPhysical, &dxvkDevice);
-        LogCategory("DXVK", "HOTFIX-DIAG A04 GetVulkanHandles returned; about to GetSubmissionQueue");
         vkInterop->GetSubmissionQueue(&dxvkQueue, &dxvkQueueIndex, &dxvkQueueFamily);
-        LogCategory("DXVK", "HOTFIX-DIAG A05 GetSubmissionQueue returned");
         DxvkPathTrace("VKBRIDGE-V5 PHASE4A DXVK-CONTEXT instance=%p physical=%p device=%p queue=%p family=%u index=%u",
             dxvkInstance, dxvkPhysical, dxvkDevice, dxvkQueue, dxvkQueueFamily, dxvkQueueIndex);
 
         // maximum two hops beyond the original handle.
 
-        LogCategory("DXVK", "HOTFIX-DIAG A06 about to publish DXVK Vulkan context");
         SetDxvkVulkanContextForOpenXRProbe(
             dxvkInstance, dxvkPhysical, dxvkDevice, dxvkQueue, dxvkQueueFamily, dxvkQueueIndex);
-        LogCategory("DXVK", "HOTFIX-DIAG A07 context published; about to Release interop");
         vkInterop->Release();
-        LogCategory("DXVK", "HOTFIX-DIAG A08 interop released");
     }
     else
     {
@@ -170,18 +173,14 @@ bool AttachExistingD3D9Device(IDirect3DDevice9* device)
     // Recover its real parent IDirect3D9 and run the same core initialization
     // that the normal proxy path performs before CreateDevice.
     IDirect3D9* parent = nullptr;
-    LogCategory("DXVK", "HOTFIX-DIAG A09 about to GetDirect3D");
     const HRESULT parentHr = device->GetDirect3D(&parent);
-    LogCategory("DXVK", "HOTFIX-DIAG A10 GetDirect3D returned hr=0x%08X parent=%p", (unsigned)parentHr, parent);
     DxvkPathTrace("V11 GetDirect3D hr=0x%08X parent=%p",
         (unsigned)parentHr, parent);
 
     bool coreOk = false;
     if (SUCCEEDED(parentHr) && parent)
     {
-        LogCategory("DXVK", "HOTFIX-DIAG A11 about to HookCreateDevice(parent)");
         coreOk = HookCreateDevice(parent);
-        LogCategory("DXVK", "HOTFIX-DIAG A12 HookCreateDevice(parent) returned=%s", coreOk ? "TRUE" : "FALSE");
         DxvkPathTrace("V11 HookCreateDevice(parent)=%s", coreOk ? "TRUE" : "FALSE");
         parent->Release();
         parent = nullptr;

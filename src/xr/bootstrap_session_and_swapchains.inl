@@ -8,7 +8,27 @@
             return true;
         }
 
-        const char* extensions[] = { XR_KHR_D3D12_ENABLE_EXTENSION_NAME };
+        // Legacy D3D12 bootstrap mirrors the Vulkan path's optional Frame
+        // extension negotiation; unsupported runtimes remain unchanged.
+        constexpr const char* kFrameExtension = "XR_VALVE_frame_controller_interaction";
+        uint32_t extensionCount = 0;
+        std::vector<XrExtensionProperties> availableExtensions;
+        if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, 0,
+                &extensionCount, nullptr)))
+        {
+            availableExtensions.resize(extensionCount);
+            for (auto& e : availableExtensions) e.type = XR_TYPE_EXTENSION_PROPERTIES;
+            if (XR_FAILED(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount,
+                    &extensionCount, availableExtensions.data())))
+                availableExtensions.clear();
+        }
+        g_hatVrFrameControllerExtensionEnabled = false;
+        for (const auto& e : availableExtensions)
+            if (std::strcmp(e.extensionName, kFrameExtension) == 0)
+                g_hatVrFrameControllerExtensionEnabled = true;
+        std::vector<const char*> extensions{ XR_KHR_D3D12_ENABLE_EXTENSION_NAME };
+        if (g_hatVrFrameControllerExtensionEnabled)
+            extensions.push_back(kFrameExtension);
 
         XrInstanceCreateInfo createInfo{ XR_TYPE_INSTANCE_CREATE_INFO };
         strcpy_s(createInfo.applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE,
@@ -18,8 +38,8 @@
             "UE3-AHiT-VR-Mod");
         createInfo.applicationInfo.engineVersion = 1;
         createInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-        createInfo.enabledExtensionCount = 1;
-        createInfo.enabledExtensionNames = extensions;
+        createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+        createInfo.enabledExtensionNames = extensions.data();
 
         DxvkPathTrace("V15 xrCreateInstance FORENSICS BEGIN");
 

@@ -544,26 +544,36 @@ static void __fastcall AV_V215HookedBuildRefToLocal(
                     if(AV_V259IsDescendantOf(b,hi,parents,avV16Rig.count) &&
                        avV16SavedValid)
                     {
-                        // in principle. Do NOT rebuild LocalAtoms here. Take the
-                        // complete CURRENT animated component-space descendant pose
-                        // and rigidly carry it from the old animated wrist into the
-                        // solved VR wrist. This is what Mixed uses for fingers,
-                        // ItemPalm and any other authored hand descendants.
-                        // one pose generation. On partial SpaceBases refreshes the
-                        // wrist can still be HatVR's published atom while a finger
-                        // atom has already changed (or vice versa), producing a
-                        // one-frame bad rigid-carry delta. If the saved wrist is
-                        // exactly our previous published wrist, use the matching
-                        // published descendant as well.
-                        const bool v112PublishedWrist =
+                        // Keep the wrist and each attachment descendant from one
+                        // coherent input generation. UE3 can refresh SpaceBases
+                        // incrementally: an incoming wrist may already equal our
+                        // last published VR pose while ItemPalm has been animated,
+                        // or an incoming wrist may be fresh while ItemPalm still
+                        // contains our last published VR transform. Rigidly
+                        // carrying either mixed pair applies a delta twice (or
+                        // subtracts it from the wrong wrist), making held actors
+                        // briefly jump between positions on single-mesh rigs.
+                        //
+                        // If EITHER end still matches the last published pose,
+                        // carry the matching published wrist+descendant pair.
+                        // Otherwise use the two incoming atoms together. This
+                        // deliberately favors a one-frame held attachment pose
+                        // over creating a transform from incompatible generations.
+                        const bool v112HavePublishedPair =
                             g_avV97PublishedValid &&
                             g_avV97PublishedOwner==poseComp &&
-                            g_avV97PublishedCount==avV16Rig.count &&
+                            g_avV97PublishedCount==avV16Rig.count;
+                        const bool v112PublishedWrist = v112HavePublishedPair &&
                             memcmp(&avV16Saved[hi],&g_avV97Published[hi],
                                    sizeof(AV_V27Atom48))==0;
-                        const AV_V27Atom48& driverOld = v112PublishedWrist
+                        const bool v112PublishedChild = v112HavePublishedPair &&
+                            memcmp(&avV16Saved[b],&g_avV97Published[b],
+                                   sizeof(AV_V27Atom48))==0;
+                        const bool v112UsePublishedPair =
+                            v112PublishedWrist || v112PublishedChild;
+                        const AV_V27Atom48& driverOld = v112UsePublishedPair
                             ? g_avV97Published[hi] : avV16Saved[hi];
-                        AV_V27Atom48 child = v112PublishedWrist
+                        AV_V27Atom48 child = v112UsePublishedPair
                             ? g_avV97Published[b] : avV16Saved[b];
 
                         XrQuaternionf oldQ=AV_V220QNorm({

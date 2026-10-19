@@ -1,3 +1,9 @@
+    // Declared before scene-producer tracking, which records the active eye.
+    static thread_local bool g_v26InsideDraw = false;
+    static thread_local bool g_v26SecondPass = false;
+    // Full-frame NewSequentialStereo uses per-command eye identity; the old experimental
+    // D3D raster-eye state from V4 has no consumers and has been removed.
+
     static volatile LONG64 g_stereoCaptureGeneration=0;
     // Begin and locate the OpenXR frame before UE3 constructs the gameplay
     // FSceneViews. This gives both native eyes the predicted-display-time pose.
@@ -21,6 +27,7 @@
         long long producerQpc = 0;
         unsigned long producerTid = 0;
         uintptr_t producerReturnRva = 0;
+        int eyeTag = -1; // NewSequentialStereo test: immutable producer-side eye identity
     };
     static SceneProducerRecord g_sceneProducerHistory[64] = {};
     static volatile LONG64 g_sceneProducerSerial = 0;
@@ -37,6 +44,26 @@
     static volatile LONG64 g_lastExecutedSceneCameraSerial = 0;
     static volatile LONG64 g_lastExecutedScenePresentAtProduce = 0;
     static volatile LONG64 g_lastExecutedSceneQpc = 0;
+
+    // Standard Stereo-only completion snapshot. Do NOT modify the shared
+    // producer lookup/entry-time publications used by Recommended and Sequential.
+    // An SRW lock prevents capture from seeing a partially published tuple.
+    struct StandardStereoCompletedExecution
+    {
+        unsigned long long producerSerial = 0;
+        unsigned long long poseSerial = 0;
+        unsigned long long presentAtProduce = 0;
+    };
+    static SRWLOCK g_standardStereoCompletionLock = SRWLOCK_INIT;
+    static StandardStereoCompletedExecution g_standardStereoCompletedExecution{};
+
+    static StandardStereoCompletedExecution ReadStandardStereoCompletedExecution()
+    {
+        AcquireSRWLockShared(&g_standardStereoCompletionLock);
+        const StandardStereoCompletedExecution result = g_standardStereoCompletedExecution;
+        ReleaseSRWLockShared(&g_standardStereoCompletionLock);
+        return result;
+    }
 
     using V67ProbeFn = unsigned long long (*)(
         uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t,uintptr_t);
@@ -509,7 +536,7 @@
         // setup transition arms the next 100 candidate fullscreen draws.
         // Skip the very first observation; it is initialization, not a user
         // setting transition.
-        if (changed && last14c != -1)
+        if (changed && last14c != -1 && g_debugToolsEnabled)
         {
             InterlockedExchange(&g_v44PpCaptureFactor, post14c);
             InterlockedExchange(&g_v44PpCaptureWidth, post150);
@@ -569,6 +596,7 @@
         const bool v137GameplayProducer =
             !g_v137InsideSecondProducer &&
             !g_nativeStereoEnabled &&
+            (!g_newSequentialStereoEnabled || g_newSequentialStereoHybridOneDraw) &&
             g_alternatingStereoEnabled &&
             a2 != 0 &&
             reinterpret_cast<void*>(a2) == g_v137ProducerGameplayViewFamily;
@@ -576,6 +604,27 @@
         // First producer is completely ordinary AFR/UE3 behavior.
         const unsigned long long result = g_originalSceneProducer
             ? g_originalSceneProducer(a1,a2,a3,a4,a5,a6,a7,a8) : 0;
+
+        // Hybrid: record LEFT before creating RIGHT. Normal Sequential's old
+        // producer bookkeeping runs after BOTH constructors and only retained
+        // RIGHT's identity; NewSequentialStereo's per-command capture requires both.
+        if (v137GameplayProducer && g_newSequentialStereoEnabled &&
+            g_newSequentialStereoHybridOneDraw && g_lastCreatedSceneRenderer)
+        {
+            const unsigned long long serial = (unsigned long long)
+                InterlockedIncrement64(&g_sceneProducerSerial);
+            SceneProducerRecord left{};
+            left.renderer = g_lastCreatedSceneRenderer;
+            left.viewArray = g_lastCreatedSceneViewArray;
+            left.producerSerial = serial;
+            left.poseSerial = g_renderPoseSnapshotSerial;
+            left.cameraSerial = g_v72CameraSerial;
+            left.presentAtProduce = (unsigned long long)g_presentFrameNumber;
+            left.producerTid = GetCurrentThreadId();
+            left.producerReturnRva = retRva;
+            left.eyeTag = 0;
+            g_sceneProducerHistory[serial & 63ULL] = left;
+        }
 
         // same gameplay family.  This is intentionally still the same AFR eye;
         // the goal is to prove that fresh constructor-time renderer state keeps
@@ -588,7 +637,7 @@
             g_v137InsideSecondProducer = true;
             const LONG64 pair = InterlockedIncrement64(&g_v137FreshRendererPairs);
 
-            if (pair <= 24 || (pair % 600) == 0)
+            if (g_debugToolsEnabled && (pair <= 24 || (pair % 600) == 0))
                 DxvkPathTrace(
                     "V139 SAME_TICK_RIGHT_PRODUCER begin pair=%lld family=%p present=%llu snap=%llu eye=%s",
                     (long long)pair,
@@ -599,7 +648,7 @@
 
             g_originalSceneProducer(a1,a2,a3,a4,a5,a6,a7,a8);
 
-            if (pair <= 24 || (pair % 600) == 0)
+            if (g_debugToolsEnabled && (pair <= 24 || (pair % 600) == 0))
                 DxvkPathTrace(
                     "V139 SAME_TICK_RIGHT_PRODUCER end pair=%lld family=%p present=%llu",
                     (long long)pair,
@@ -612,7 +661,8 @@
         // renderer that is later queued as FDrawSceneCommand.
         if (retRva == 0x5D8C29 || retRva == 0x5D822C)
         {
-            LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
+            LARGE_INTEGER q{};
+            if (g_debugToolsEnabled) QueryPerformanceCounter(&q);
             const unsigned long long serial =
                 (unsigned long long)InterlockedIncrement64(&g_sceneProducerSerial);
             SceneProducerRecord slot{};
@@ -625,9 +675,13 @@
             slot.producerQpc = q.QuadPart;
             slot.producerTid = GetCurrentThreadId();
             slot.producerReturnRva = retRva;
+            slot.eyeTag = (g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw &&
+                v137GameplayProducer) ? 1 :
+                (g_newSequentialStereoEnabled && g_v26InsideDraw
+                    ? (g_v26SecondPass ? 1 : 0) : -1);
             g_sceneProducerHistory[serial & 63ULL] = slot;
 
-            if (serial <= 32 || (serial % 120ULL) == 0)
+            if (g_debugToolsEnabled && (serial <= 32 || (serial % 120ULL) == 0))
             {
                 char line[512] = {};
                 sprintf_s(line,sizeof(line),
@@ -645,12 +699,19 @@
     // exactly one FSceneView at index 0. Pass 1 writes the LEFT SBS half; pass 2
     // writes the RIGHT SBS half. The second pass reuses the same frozen OpenXR
     // snapshot, so this is not AFR and does not resample head pose.
-    static bool g_v26SequentialReentry = true; // HYBRID-V1: sequential gameplay Draw reentry for compatibility AFR
-    static thread_local bool g_v26InsideDraw = false;
-    static thread_local bool g_v26SecondPass = false;
+    static bool g_v26SequentialReentry = false; // restored default: explicit NewSequentialStereo test enables complete Draw re-entry
     static thread_local bool g_v26SawGameplayCalc = false;
     static volatile LONG64 g_v26DrawPairs = 0;
     static volatile LONG64 g_v26SecondDraws = 0;
+
+    // The normal AFR/Sequential path can keep its original hacks. The NewSequentialStereo
+    // comparison is isolated: two complete client draws, one view per draw,
+    // and genuinely separate persistent view/camera histories.
+    static thread_local unsigned char* g_newSequentialStereoLocalPlayer = nullptr;
+    static thread_local bool g_newSequentialStereoRightCameraHistoryValid = false;
+    static thread_local LONG g_newSequentialStereoSeenModeGeneration = -1;
+    static thread_local unsigned char g_newSequentialStereoRightCameraHistory[12] = {};
+    static uintptr_t V51GetOrCreateRightViewState();
 
     using V26GameplayDrawFn = void(__fastcall*)(void*, void*, void*);
     static V26GameplayDrawFn g_originalV26GameplayDraw = nullptr;
@@ -667,6 +728,11 @@
         if (!g_originalV26GameplayDraw)
             return;
 
+        // Suppress the game's native mirrored-image flag for the Mirror Badge
+        // and Rift Collapse. This executes for Stereo, Sequential, and NewSequentialStereo,
+        // even when the NewSequentialStereo one-Draw hybrid is selected.
+        ForceMirrorModeOffForVr(self);
+
         if (!g_v26SequentialReentry || g_v26InsideDraw ||
             g_nativeStereoEnabled || !g_alternatingStereoEnabled)
         {
@@ -681,26 +747,90 @@
         g_v26InsideDraw = true;
         g_v26SecondPass = false;
         g_v26SawGameplayCalc = false;
-        g_originalV26GameplayDraw(self, a2, a3); // LEFT, ordinary single-view UE3
+        if (g_newSequentialStereoEnabled)
+        {
+            g_newSequentialStereoLocalPlayer = nullptr;
+            const LONG generation = InterlockedCompareExchange(&g_newSequentialStereoModeGeneration, 0, 0);
+            if (g_newSequentialStereoSeenModeGeneration != generation)
+            {
+                g_newSequentialStereoRightCameraHistoryValid = false;
+                g_newSequentialStereoSeenModeGeneration = generation;
+            }
+        }
+        g_originalV26GameplayDraw(self, a2, a3); // LEFT
 
         const bool wasGameplay = g_v26SawGameplayCalc;
         if (wasGameplay && g_renderPoseSnapshotValid && g_xrViewsValidThisFrame)
         {
-            g_v26SecondPass = true;
-            g_v26SawGameplayCalc = false;
-            InterlockedIncrement64(&g_v26SecondDraws);
-            g_originalV26GameplayDraw(self, a2, a3); // RIGHT, again Views[0]
-            g_v26SecondPass = false;
-            const LONG64 pair = InterlockedIncrement64(&g_v26DrawPairs);
-            if (pair <= 12 || (pair % 600) == 0)
-                DxvkPathTrace("HYBRID-V1 V26 SEQUENTIAL_REENTRY pair=%lld secondDraws=%lld snap=%llu",
-                    (long long)pair,
-                    (long long)InterlockedCompareExchange64(&g_v26SecondDraws,0,0),
-                    (unsigned long long)g_renderPoseSnapshotSerial);
+            // An NewSequentialStereo-style full second scene needs its *own* render history,
+            // and must not leak its camera history into the next game tick.
+            // This is the part regular Sequential wasn't doing.
+            unsigned char savedLeftCamera[12] = {};
+            bool haveCamera = false;
+            uintptr_t rightState = 0;
+            if (g_newSequentialStereoEnabled)
+            {
+                rightState = V51GetOrCreateRightViewState();
+                if (g_newSequentialStereoLocalPlayer && rightState)
+                {
+                    __try
+                    {
+                        memcpy(savedLeftCamera, g_newSequentialStereoLocalPlayer + 0x110, sizeof(savedLeftCamera));
+                        if (g_newSequentialStereoRightCameraHistoryValid)
+                            memcpy(g_newSequentialStereoLocalPlayer + 0x110, g_newSequentialStereoRightCameraHistory, sizeof(savedLeftCamera));
+                        haveCamera = true;
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { haveCamera = false; }
+                }
+                // Don't queue a half-valid second eye if the engine state factory
+                // couldn't allocate a distinct right-eye state.
+                if (!rightState || !haveCamera)
+                    DxvkPathTrace("NEW_SEQUENTIAL_STEREO-TEST skipped right eye: viewState=%p localPlayer=%p cameraOk=%d",
+                        reinterpret_cast<void*>(rightState), g_newSequentialStereoLocalPlayer, haveCamera?1:0);
+            }
+
+            if (!g_newSequentialStereoEnabled || (rightState && haveCamera))
+            {
+                g_v26SecondPass = true;
+                g_v26SawGameplayCalc = false;
+                InterlockedIncrement64(&g_v26SecondDraws);
+                g_originalV26GameplayDraw(self, a2, a3); // RIGHT, again Views[0]
+                g_v26SecondPass = false;
+                const LONG64 pair = InterlockedIncrement64(&g_v26DrawPairs);
+                if (g_newSequentialStereoEnabled)
+                {
+                    if (haveCamera)
+                    {
+                        __try
+                        {
+                            memcpy(g_newSequentialStereoRightCameraHistory, g_newSequentialStereoLocalPlayer + 0x110, sizeof(savedLeftCamera));
+                            g_newSequentialStereoRightCameraHistoryValid = true;
+                            memcpy(g_newSequentialStereoLocalPlayer + 0x110, savedLeftCamera, sizeof(savedLeftCamera));
+                        }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { g_newSequentialStereoRightCameraHistoryValid = false; }
+                    }
+                    if (g_debugToolsEnabled && (pair <= 12 || (pair % 300) == 0))
+                        DxvkPathTrace("NEW_SEQUENTIAL_STEREO-TEST pair=%lld snap=%llu rightState=%p separateCamera=%d",
+                            (long long)pair,(unsigned long long)g_renderPoseSnapshotSerial,
+                            reinterpret_cast<void*>(rightState),haveCamera?1:0);
+                }
+                else if (pair <= 12 || (pair % 600) == 0)
+                    DxvkPathTrace("HYBRID-V1 V26 SEQUENTIAL_REENTRY pair=%lld secondDraws=%lld snap=%llu",
+                        (long long)pair,
+                        (long long)InterlockedCompareExchange64(&g_v26SecondDraws,0,0),
+                        (unsigned long long)g_renderPoseSnapshotSerial);
+            }
+            else g_v138SameTickAfrActive = false;
         }
+        else if (g_newSequentialStereoEnabled) g_v138SameTickAfrActive = false;
 
         g_v26SecondPass = false;
         g_v26InsideDraw = false;
+        if (g_newSequentialStereoEnabled)
+        {
+            g_calcSceneRightEye = false;
+            g_renderRightEye = false;
+        }
     }
 
     // exact FSceneRenderer constructed from it.  This prevents the low-level
@@ -764,8 +894,8 @@
         // Compare genuine LEFT vs genuine RIGHT immediately before renderer #2
         // construction. This deliberately changes NO view state.
 
-        if (g_v137InsideSecondProducer &&
-            g_v138SameTickAfrActive &&
+        if ((!g_newSequentialStereoEnabled || g_newSequentialStereoHybridOneDraw) &&
+            g_v137InsideSecondProducer && g_v138SameTickAfrActive &&
             !g_nativeStereoEnabled && g_alternatingStereoEnabled &&
             g_v146GenuineRightView &&
             g_v146GenuineRightFamily == reinterpret_cast<void*>(a2) &&
@@ -896,7 +1026,8 @@
             }
         }
 
-        if ((v39Create <= 24 || (v39Create % 120ULL) == 0) &&
+        if (g_debugToolsEnabled &&
+            (v39Create <= 24 || (v39Create % 120ULL) == 0) &&
             srcCount >= 2 && srcViews[0] && srcViews[1])
         {
             char diff[4096] = {};
@@ -958,7 +1089,7 @@
         uintptr_t v39LeftState = 0;
         uintptr_t v39RightStateBefore = 0;
         bool v39Patched = false;
-        if (srcCount >= 2 && srcViews[0] && srcViews[1])
+        if (g_debugToolsEnabled && srcCount >= 2 && srcViews[0] && srcViews[1])
         {
             __try
             {
@@ -970,7 +1101,8 @@
                 // we want its vtable and executable RVAs to identify the
                 // engine-owned creation/destruction path for a second independent
                 // persistent state rather than cloning/sharing this object.
-                if (v39LeftState && (v39Create <= 8 || (v39Create % 120ULL) == 0))
+                if (g_debugToolsEnabled && v39LeftState &&
+                    (v39Create <= 8 || (v39Create % 120ULL) == 0))
                 {
                     auto* state = reinterpret_cast<unsigned char*>(v39LeftState);
                     uintptr_t vt = *reinterpret_cast<uintptr_t*>(state);
@@ -1031,7 +1163,7 @@
             }
         }
 
-        if (v39Create <= 24 || (v39Create % 120ULL) == 0)
+        if (g_debugToolsEnabled && (v39Create <= 24 || (v39Create % 120ULL) == 0))
         {
             DxvkPathTrace(
                 "V39 VIEWSTATE-PATCH create=%llu patched=%d L=%p Rbefore=%p sourceL=%p sourceR=%p",
@@ -1044,7 +1176,8 @@
         // Emit contiguous differing ranges and pointer-sized differences.
         // Camera-heavy regions are tagged to ignore them when selecting
         // decal candidates; nothing is patched in this build.
-        if (v146RightOnlyCtor && g_v151GenuineLeftView && g_v146GenuineRightView)
+        if (g_debugToolsEnabled && v146RightOnlyCtor &&
+            g_v151GenuineLeftView && g_v146GenuineRightView)
         {
             static unsigned int v152DiffLogs = 0;
             if (v152DiffLogs++ < 4)
@@ -1258,7 +1391,7 @@
 
         // Capture these completed-renderer regions from LEFT renderer #1 and
         // compare against genuine RIGHT renderer #2. Passive only.
-        if (viewArray && viewCount > 0 &&
+        if (!g_newSequentialStereoEnabled && viewArray && viewCount > 0 &&
             !g_nativeStereoEnabled && g_alternatingStereoEnabled &&
             a2 && reinterpret_cast<void*>(a2) == g_v136GameplayViewFamily)
         {
@@ -1266,7 +1399,8 @@
             {
                 auto* fv = static_cast<unsigned char*>(viewArray);
 
-                if (!g_v137InsideSecondProducer && !v146RightOnlyCtor)
+                if (!g_v137InsideSecondProducer && !v146RightOnlyCtor &&
+                    !g_sequentialIndependentFvi)
                 {
                     memcpy(g_v153Left600_7FF, fv + 0x600, sizeof(g_v153Left600_7FF));
                     memcpy(g_v153Left1130_117F, fv + 0x1130, sizeof(g_v153Left1130_117F));
@@ -1276,6 +1410,7 @@
                     g_v153LeftDecalStateValid = true;
                 }
                 else if (v146RightOnlyCtor &&
+                         !g_sequentialIndependentFvi &&
                          g_v153LeftDecalStateValid &&
                          g_v153LeftDecalPoseSerial == g_renderPoseSnapshotSerial)
                 {
@@ -1434,7 +1569,8 @@
 
         // already proved there are two; this tells us whether the same
         // left-non-null/right-null state survives the copy.
-        if ((v39Create <= 24 || (v39Create % 120ULL) == 0) &&
+        if (g_debugToolsEnabled &&
+            (v39Create <= 24 || (v39Create % 120ULL) == 0) &&
             viewArray && viewCount >= 2)
         {
             __try
@@ -1535,20 +1671,10 @@
     static unsigned long long HookSceneExecute(void* command)
     {
 
-        // Pair this with PIPE_CAMERA/PHASE/PIPE_PRESENT in the same log.
+        // Keep a timing stamp only for the existing pose-correlation metadata.
+        // The old unconditional PIPE_EXEC string/file log ran for every eye.
         LARGE_INTEGER v73Enter{};
-        QueryPerformanceCounter(&v73Enter);
-        const unsigned long long v73CamAtEnter = g_v72CameraSerial;
-        const unsigned long long v73PresentAtEnter =
-            (unsigned long long)g_presentFrameNumber;
-        {
-            char line[320] = {};
-            sprintf_s(line, sizeof(line),
-                "PIPE_EXEC stage=ENTER camSerial=%llu present=%llu command=%p qpc=%lld tid=%lu\n",
-                v73CamAtEnter, v73PresentAtEnter, command,
-                (long long)v73Enter.QuadPart, (unsigned long)GetCurrentThreadId());
-            RenderPipelineDiagnosticLog(line);
-        }
+        if (g_debugToolsEnabled) QueryPerformanceCounter(&v73Enter);
 
         // then match renderer + exact viewArray to the producer record.
         SceneProducerRecord v78Hit{};
@@ -1587,7 +1713,8 @@
             InterlockedExchange64(&g_lastExecutedSceneProducerSerial,(LONG64)v78Hit.producerSerial);
             InterlockedExchange64(&g_lastExecutedSceneCameraSerial,(LONG64)v78Hit.cameraSerial);
             InterlockedExchange64(&g_lastExecutedScenePresentAtProduce,(LONG64)v78Hit.presentAtProduce);
-            InterlockedExchange64(&g_lastExecutedSceneQpc,(LONG64)v73Enter.QuadPart);
+            if (g_debugToolsEnabled)
+                InterlockedExchange64(&g_lastExecutedSceneQpc,(LONG64)v73Enter.QuadPart);
 
             // before later camera activity can clear g_renderPoseSnapshotValid.
             const unsigned long long v83Pose = v78Hit.poseSerial;
@@ -1603,7 +1730,8 @@
                 InterlockedExchange(&g_rendererBoundViewsValid, 1);
             }
         }
-        if (v78Ex <= 32 || (v78Ex % 120ULL) == 0 || !v78Found)
+        if (g_debugToolsEnabled &&
+            (v78Ex <= 32 || (v78Ex % 120ULL) == 0 || !v78Found))
         {
             static LARGE_INTEGER v78Freq{};
             if (!v78Freq.QuadPart) QueryPerformanceFrequency(&v78Freq);
@@ -1620,19 +1748,33 @@
             RenderPipelineDiagnosticLog(line);
         }
 
+        // The producer eye tag is kept in the queued command record, not in
+        // thread-local D3D viewport state. No raster interception is needed.
         const unsigned long long result =
             g_originalSceneExecute ? g_originalSceneExecute(command) : 0;
-
-        LARGE_INTEGER v73Exit{};
-        QueryPerformanceCounter(&v73Exit);
+        // This is ONLY an observation after UE3's original Execute returns.
+        // Keep every pre-existing matching rule and NewSequentialStereo capture operation
+        // untouched. No new renderer work, new eye capture, or GPU synchronization.
+        if (g_nativeStereoEnabled && !g_newSequentialStereoEnabled && v78Found &&
+            v78Hit.producerSerial != 0 && v78Hit.poseSerial != 0)
         {
-            char line[320] = {};
-            sprintf_s(line, sizeof(line),
-                "PIPE_EXEC stage=EXIT camSerial=%llu present=%llu command=%p qpc=%lld tid=%lu\n",
-                v73CamAtEnter, (unsigned long long)g_presentFrameNumber, command,
-                (long long)v73Exit.QuadPart, (unsigned long)GetCurrentThreadId());
-            RenderPipelineDiagnosticLog(line);
+            AcquireSRWLockExclusive(&g_standardStereoCompletionLock);
+            if (v78Hit.producerSerial > g_standardStereoCompletedExecution.producerSerial)
+            {
+                g_standardStereoCompletedExecution.producerSerial = v78Hit.producerSerial;
+                g_standardStereoCompletedExecution.poseSerial = v78Hit.poseSerial;
+                g_standardStereoCompletedExecution.presentAtProduce = v78Hit.presentAtProduce;
+            }
+            ReleaseSRWLockExclusive(&g_standardStereoCompletionLock);
         }
+
+        // Exact per-eye renderer completion point (not game-thread Draw end).
+        // Capture before UE3 executes the next eye's queued renderer.
+        if (g_newSequentialStereoEnabled && v78Found && v78Hit.eyeTag >= 0 &&
+            v78Hit.eyeTag <= 1)
+            NewSequentialStereoCaptureCompleteEye(v78Hit.eyeTag, v78Hit.poseSerial,
+                v78Hit.presentAtProduce);
+
         return result;
     }
     // Static RE from HatinTimeGame.exe:

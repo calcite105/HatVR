@@ -1,3 +1,19 @@
+    // Config path is needed by XR hooks included before core/config.inl.
+static char g_hatVrConfigPath[MAX_PATH] = {};
+    // Default to the 0.20 full-frame, one-gameplay-draw stereo renderer.
+    // Existing user-selected StereoMode settings remain respected.
+    static bool g_newSequentialStereoHudSinglePass = true;
+    static bool g_newSequentialStereoLatePromptReplay = true;
+    // Test: preserve the game's vertical viewport when replaying Family B.
+    static bool g_newSequentialStereoPromptPreserveViewport = true;
+    static bool g_newSequentialStereoUiKeepPixelAspect = true;
+    // The new renderer uses cropped-height 16:9 UI (no world-height override).
+    static bool g_newSequentialStereoUiCrop16x9 = true;
+    // Declared here because FViewport hooks are included before ui_discovery.inl.
+    static volatile LONG g_insideHudWindow = 0;
+    static bool g_sequentialIndependentFvi = false; // opt-in accuracy experiment
+    static bool g_newSequentialStereoHybridOneDraw = true; // 0.20: one gameplay draw, two complete eye scenes
+
     // AHiT D3D9 focus window. Used to keep retained debug hotkeys foreground-only.
     static HWND g_hatVrGameWindow = nullptr;
 
@@ -154,6 +170,20 @@
     // Optional r261 direct OpenXR eye projection. Native Stereo only.
     // Defined by vulkan_backend.cpp because Vulkan submission also consumes it.
     extern bool g_sharperNativeStereo;
+    // New A/B rendering mode: complete sequential scene draws with per-eye state.
+    extern bool g_newSequentialStereoEnabled;
+    static unsigned int NewSequentialStereoCroppedUiHeight(unsigned int width, unsigned int fullHeight)
+    {
+        if (!g_newSequentialStereoEnabled || !g_newSequentialStereoUiCrop16x9 ||
+            width < 16u || fullHeight < 16u) return 0;
+        // Round to nearest: e.g. 2040x2080 -> 2040x1148.
+        const unsigned int height = static_cast<unsigned int>(
+            (static_cast<unsigned long long>(width) * 9ull + 8ull) / 16ull);
+        return (height > 0 && height <= fullHeight) ? height : 0;
+    }
+    static volatile LONG g_newSequentialStereoModeGeneration = 0;
+    static void HatVrCycleRenderingMode();
+    static void HatVrToggleOtherRenderers();
     // vulkan_backend.cpp so the menu renderer and D3D9 hook TU share one state.
     extern bool g_debugToolsEnabled;
     // User-facing menu font. Defined by vulkan_backend.cpp so the renderer and
@@ -198,7 +228,6 @@
     static int g_vrMenuSelection = 0;
     // false = category/sidebar focus, true = inside selected category.
     static bool g_vrMenuInsideCategory = false;
-    bool g_recommendedGraphicsMenuOpen = false; // legacy compatibility; no longer a separate page
 
     // PSVR2 headset-rumble routing. The first functional pass deliberately
     // accepts only strong game-authored controller feedback. Static source
@@ -209,6 +238,31 @@
     extern bool g_psvr2HmdRumbleEnabled;
     extern bool g_psvr2StrongPhysicalOnly; // legacy config compatibility
     extern bool g_psvr2EyeWheelEnabled;
+    extern int g_psvr2EyeWheelOffsetX;
+    extern int g_psvr2EyeWheelOffsetY;
+    extern int g_psvr2EyeWheelStability;
+    extern int g_psvr2EyeWheelDeadzone;
+    extern int g_psvr2EyeWheelRadius;
+    extern bool g_psvr2EyeWheelDebugVisuals;
+    extern bool g_showOtherRenderers;
+
+    // Graphics notes are relevant to the alternative renderers only.
+    static bool HatVrMenuPageVisible(int page)
+    {
+        return page != 5 || g_showOtherRenderers;
+    }
+
+    static int HatVrMenuStepPage(int current, int direction)
+    {
+        const int count = g_debugToolsEnabled ? 7 : 6;
+        if (current < 0 || current >= count) current = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            current = (current + count + (direction < 0 ? -1 : 1)) % count;
+            if (HatVrMenuPageVisible(current)) return current;
+        }
+        return 0;
+    }
     extern bool g_psvr2MenuOpen;
     extern int  g_psvr2HmdRumbleIntensity; // 0..100; 100 leaves source intensity unchanged
     extern int  g_psvr2HmdRumbleCurve;     // 0 Linear, 1 Preserve Low, 2 Reduce Low

@@ -42,10 +42,12 @@
 #define HATVR_HAS_VULKAN_HEADERS 1
 
 namespace ahitvr {
-    extern bool g_recommendedGraphicsMenuOpen;
     // Release-safe master gate for retained development/debug tools. The tools
     bool g_debugToolsEnabled = false;
+    bool g_hatVrFrameControllerExtensionEnabled = false;
     bool g_sharperNativeStereo = false;
+    bool g_showOtherRenderers = false;
+    bool g_newSequentialStereoEnabled = true; // 0.20 default renderer
     bool g_spectatorExpandedFov = false;
     // User-facing HatVR menu font choice. Curse Casual is the default; the
     // ordinary Dear ImGui font remains available as a compatibility/fallback option.
@@ -86,6 +88,29 @@ namespace ahitvr
     bool g_psvr2HmdRumbleEnabled = false;
     bool g_psvr2StrongPhysicalOnly = true; // legacy
     bool g_psvr2EyeWheelEnabled = true;
+    // Tunable eye-wheel alignment and temporal filtering. Percentages refer
+    // to normalized HUD space, independent of the HMD display resolution.
+    int g_psvr2EyeWheelOffsetX = 0;
+    int g_psvr2EyeWheelOffsetY = 0;
+    int g_psvr2EyeWheelStability = 50;
+    int g_psvr2EyeWheelDeadzone = 40;
+    int g_psvr2EyeWheelRadius = 90; // % of HUD HALF-height; circular on the real HUD
+    bool g_psvr2EyeWheelDebugVisuals = false; // intentionally opt-in, saved in HatVR.ini
+    static SRWLOCK g_eyeWheelDebugLock = SRWLOCK_INIT;
+    static HatVrEyeWheelDebugSample g_eyeWheelDebugSample{};
+    void HatVrPublishEyeWheelDebug(const HatVrEyeWheelDebugSample& sample)
+    {
+        AcquireSRWLockExclusive(&g_eyeWheelDebugLock);
+        g_eyeWheelDebugSample = sample;
+        ReleaseSRWLockExclusive(&g_eyeWheelDebugLock);
+    }
+    HatVrEyeWheelDebugSample HatVrReadEyeWheelDebug()
+    {
+        AcquireSRWLockShared(&g_eyeWheelDebugLock);
+        const HatVrEyeWheelDebugSample sample = g_eyeWheelDebugSample;
+        ReleaseSRWLockShared(&g_eyeWheelDebugLock);
+        return sample;
+    }
     bool g_psvr2MenuOpen = false;
     int  g_psvr2HmdRumbleIntensity = 100;
     int  g_psvr2HmdRumbleCurve = 0;
@@ -120,7 +145,6 @@ namespace ahitvr
         uint32_t g_vkQueueIndex = 0;
         bool g_vkOwnsInstance = false;
         bool g_vkOwnsDevice = false;
-        bool g_vkUsingDxvkDevice = false;
 
         VkInstance g_dxvkProbeInstance = VK_NULL_HANDLE;
         VkPhysicalDevice g_dxvkProbePhysical = VK_NULL_HANDLE;
@@ -134,6 +158,14 @@ namespace ahitvr
         int64_t g_vkSwapchainFormat = 0;
         uint32_t g_vkSwapchainWidth = 0;
         uint32_t g_vkSwapchainHeight = 0;
+        // OpenXR owns the last released eye images. On an incomplete NewSequentialStereo
+        // pair reuse those images and their ORIGINAL rendering poses; do not
+        // transfer the mutable D3D9 eye textures again.
+        bool g_vkHaveReusableEyePair = false;
+        bool g_vkLastEyePairTheaterMode = false;
+        XrView g_vkLastEyePairViews[2] = {
+            { XR_TYPE_VIEW }, { XR_TYPE_VIEW }
+        };
         uint32_t g_vkRecommendedEyeWidth = 0;
         uint32_t g_vkRecommendedEyeHeight = 0;
         uint32_t g_vkMaxEyeWidth = 0;
@@ -150,6 +182,12 @@ namespace ahitvr
         std::vector<XrSwapchainImageVulkan2KHR> g_vkUiSwapchainImages;
         uint32_t g_vkUiWidth = 0;
         uint32_t g_vkUiHeight = 0;
+        // Pixel aspect of the last captured game Canvas, not XR eye texture.
+        // In eye-sized NewSequentialStereo the source is near-square, unlike the old SBS UI.
+        float g_vkLastUiSourceAspect = 16.0f / 9.0f;
+        bool g_vkPreserveUiPixelAspect = false;
+        bool g_vkCropNewSequentialStereoUi16x9 = false;
+
 
         // Dear ImGui is used only as a GPU 2D command generator/renderer.
         // HatVR keeps its own controller navigation and never uses a platform backend.
@@ -182,46 +220,12 @@ namespace ahitvr
         VkCommandBuffer g_vkCommandBuffer = VK_NULL_HANDLE;
         VkFence g_vkFence = VK_NULL_HANDLE;
 
-        struct VkUploadCache
-        {
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            void* mapped = nullptr;
-            VkDeviceSize capacity = 0;
-        };
-        VkUploadCache g_vkUploadCache[3] = {};
-
-        struct D3D9ReadbackCache
-        {
-            IDirect3DSurface9* surface = nullptr;
-            UINT width = 0, height = 0;
-            D3DFORMAT format = D3DFMT_UNKNOWN;
-        };
-        D3D9ReadbackCache g_vkReadbackCache[2] = {};
-        std::vector<unsigned char> g_vkCpuPixels[3];
-
-        void DestroyTransferCaches()
-        {
-            for (auto& c : g_vkUploadCache)
-            {
-                if (c.mapped && c.memory) vkUnmapMemory(g_vkDevice, c.memory);
-                if (c.buffer) vkDestroyBuffer(g_vkDevice, c.buffer, nullptr);
-                if (c.memory) vkFreeMemory(g_vkDevice, c.memory, nullptr);
-                c = {};
-            }
-            for (auto& c : g_vkReadbackCache)
-            {
-                if (c.surface) c.surface->Release();
-                c = {};
-            }
-            for (auto& v : g_vkCpuPixels) { std::vector<unsigned char>().swap(v); }
-        }
-
         PFN_vkDestroyInstance g_vkDestroyInstance = nullptr;
         PFN_vkDestroyDevice g_vkDestroyDevice = nullptr;
 
         unsigned long long g_vkBeginSerial = 0;
         unsigned long long g_vkSubmitSerial = 0;
+        bool g_vkFirstFrameSubmitted = false;
 
         bool HasExtension(const std::vector<XrExtensionProperties>& exts, const char* name)
         {
@@ -263,6 +267,8 @@ namespace ahitvr
 
         void DestroyEyeSwapchains()
         {
+            // A recreated/destroyed swapchain has no previous released image.
+            g_vkHaveReusableEyePair = false;
             for (int eye = 0; eye < 2; ++eye)
             {
                 g_vkSwapchainImages[eye].clear();
@@ -395,6 +401,7 @@ namespace ahitvr
 
             g_vkSwapchainWidth = width;
             g_vkSwapchainHeight = height;
+            DxvkPathTrace("VKXR-SWAPCHAIN EYES READY extent=%ux%u format=%lld images=(%zu,%zu)", width, height, (long long)g_vkSwapchainFormat, g_vkSwapchainImages[0].size(), g_vkSwapchainImages[1].size());
             DxvkPathTrace(
                 "VKXR-V8 SWAPCHAINS READY size=%ux%u format=%lld images=%u,%u",
                 width, height, (long long)g_vkSwapchainFormat,
@@ -660,6 +667,7 @@ namespace ahitvr
             int uiDebugCandidateIndex,unsigned int uiDebugCandidateCount,unsigned long long uiDebugCandidateHash,
             unsigned long long uiDebugCandidateHits,int uiDebugPreviewMode,int uiDebugPermanentRoute)
         {
+            if (page == 5 && !g_showOtherRenderers) page = 1;
             constexpr float W=900.0f,H=760.0f;
             ImGuiIO& io=ImGui::GetIO(); io.DisplaySize={W,H}; io.DeltaTime=1.0f/90.0f;
             g_vkMenuFont=(g_hatVrCurseCasualMenuFont && g_vkMenuCurseCasualFont)
@@ -680,6 +688,7 @@ namespace ahitvr
             ImGui::BeginChild("Sidebar",{sidebarW,0},true);
             for(int i=0;i<(g_debugToolsEnabled?7:6);++i)
             {
+                if (i == 5 && !g_showOtherRenderers) continue;
                 const bool selectedPage=(i==page);
                 if(selectedPage && !insideCategory) ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
                 ImGui::Selectable(HatVrMenuPageName(i),selectedPage);
@@ -712,7 +721,7 @@ namespace ahitvr
             if(page==0)
             {
                 ImGui::TextUnformatted("HatVR");
-                ImGui::TextDisabled("Release Candidate B - 0.1");
+                ImGui::TextDisabled("HatVR 0.20");
                 ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
                 ImGui::Text("Headset: %s",g_vkSystemName);
                 ImGui::Text("OpenXR Runtime: %s %u.%u.%u",g_vkRuntimeName,g_vkRuntimeMajor,g_vkRuntimeMinor,g_vkRuntimePatch);
@@ -727,27 +736,37 @@ namespace ahitvr
             }
             else if(page==1)
             {
-                const char* modes[]={"Synchronized Sequential","Stereo"}; int mode=nativeStereo?1:0;
-                beginSelectedRow(0); ImGui::Combo("Rendering Mode",&mode,modes,2);
-                mark(0,"Rendering Mode",nativeStereo?
-                    "Renders both eyes together using a method similar to A Hat in Time's split-screen renderer. Recommended for normal VR gameplay and generally provides better performance, though some effects may not render correctly in both eyes.":
-                    "Renders each eye separately in sequence from the same game state. May improve compatibility with effects that do not work correctly with Stereo, but requires more rendering work and may reduce performance.");
-                check("Sharper Native Stereo",g_sharperNativeStereo,1,nativeStereo ?
+                // The default is always recommended. The user must explicitly
+                // enable the alternatives before the mode selector can change it.
+                const int mode = g_newSequentialStereoEnabled ? 0 : (nativeStereo ? 1 : 2);
+                const char* modes[] = {"Recommended", "Standard Stereo", "Sequential (Legacy)"};
+                beginSelectedRow(0);
+                if (!g_showOtherRenderers) ImGui::BeginDisabled();
+                int displayMode = g_showOtherRenderers ? mode : 0;
+                ImGui::Combo("Rendering Mode", &displayMode, modes, 3);
+                if (!g_showOtherRenderers) ImGui::EndDisabled();
+                mark(0,"Rendering Mode", !g_showOtherRenderers ?
+                    "Recommended is selected. Turn on Show Other Renderers below to access the alternatives.":
+                    "Recommended provides the best compatibility. Standard Stereo may be slightly faster in certain scenes. Legacy Sequential can have rendering and pose issues.");
+                check("Show Other Renderers",g_showOtherRenderers,1,
+                    "Enables switching between all rendering modes. Turning this off immediately restores Recommended and keeps it selected.");
+                if (g_showOtherRenderers)
+                    check("Sharper Native Stereo",g_sharperNativeStereo,2,nativeStereo ?
                     "Uses the full OpenXR eye projection for a sharper image at the same render resolution instead of rendering a wider symmetric view and cropping it afterward. Some screen-space effects, especially Ambient Occlusion, may render incorrectly with this projection and should be disabled manually if needed." :
-                    "Saved for Native Stereo. This option has no effect while Synchronized Sequential is selected. In Native Stereo it uses the full OpenXR eye projection for a sharper image. Some screen-space effects, especially Ambient Occlusion, may need to be disabled manually.");
-                check("First Person (Experimental)",firstPersonEnabled,2,"Moves the gameplay camera to Hat Kid and enables the VR avatar. Third Person is the most stable way to play HatVR; First Person is experimental and some player models, animations, interactions, or camera sequences may not behave correctly.");
-                check("Mod API",g_hatVrModApiEnabled,3,"Allows compatible A Hat in Time mods to access basic HatVR state and requested tracking data. Disabled by default. Tracking data is only intended to be delivered when a mod asks for it.");
-                check("Disable Player Fade",disablePlayerFade,4,"Disables A Hat in Time's effect that fades the player when they get too close to the camera. HatVR stops overriding the fade while a cutscene camera is active. This workaround can still cause incorrect shadows on some nearby objects.");
-                check("Theater Mode",theaterMode,5,"Displays the game on a fixed stereoscopic screen instead of using the game's camera directly in VR. Useful for cutscenes or sections where direct VR camera movement is uncomfortable.");
-                check("Automatically Use Theater Mode for Cutscenes",autoTheaterCutscenes,6,"Automatically switches to Theater Mode when HatVR detects that A Hat in Time has taken control of the camera, then returns to immersive VR afterward.");
-                check("Override Locked Cameras",overrideLockedCameras,7,"Overrides certain forced camera modes so they do not take control of the VR camera. This may not work with every locked camera in the game. If a camera remains locked, temporarily switching to Third Person may be necessary.");
-                check("Upscaling",g_openXrUpscalingEnabled,8,"Upscales HatVR's completed eye image before it is submitted to OpenXR. A Hat in Time keeps rendering at its normal resolution. This is spatial image scaling, not temporal or AI reconstruction such as DLSS or FSR 2, so it cannot recreate the detail of rendering the game natively at the higher resolution.");
+                    "Saved for Standard Stereo. This setting has no effect on the recommended renderer. Standard Stereo can use the full OpenXR eye projection, but some screen-space effects may need to be disabled.");
+                check("First Person (Experimental)",firstPersonEnabled,3,"Moves the gameplay camera to Hat Kid and enables the VR avatar. Third Person is the most stable way to play HatVR; First Person is experimental and some player models, animations, interactions, or camera sequences may not behave correctly.");
+                check("Mod API",g_hatVrModApiEnabled,4,"Allows compatible A Hat in Time mods to access basic HatVR state and requested tracking data. Disabled by default. Tracking data is only intended to be delivered when a mod asks for it.");
+                check("Disable Player Fade",disablePlayerFade,5,"Disables A Hat in Time's effect that fades the player when they get too close to the camera. HatVR stops overriding the fade while a cutscene camera is active. This workaround can still cause incorrect shadows on some nearby objects.");
+                check("Theater Mode",theaterMode,6,"Displays the game on a fixed stereoscopic screen instead of using the game's camera directly in VR. Useful for cutscenes or sections where direct VR camera movement is uncomfortable.");
+                check("Automatically Use Theater Mode for Cutscenes",autoTheaterCutscenes,7,"Automatically switches to Theater Mode when HatVR detects that A Hat in Time has taken control of the camera, then returns to immersive VR afterward.");
+                check("Override Locked Cameras",overrideLockedCameras,8,"Overrides certain forced camera modes so they do not take control of the VR camera. This may not work with every locked camera in the game. If a camera remains locked, temporarily switching to Third Person may be necessary.");
+                check("Upscaling",g_openXrUpscalingEnabled,9,"Upscales HatVR's completed eye image before it is submitted to OpenXR. A Hat in Time keeps rendering at its normal resolution. This is spatial image scaling, not temporal or AI reconstruction such as DLSS or FSR 2, so it cannot recreate the detail of rendering the game natively at the higher resolution.");
                 const char* upscalers[]={"NIS","FSR 1"};
-                beginSelectedRow(9); ImGui::Combo("Upscaler",&g_openXrUpscaler,upscalers,2); mark(9,"Upscaler",g_openXrUpscaler==1 ? "AMD FidelityFX Super Resolution 1 uses EASU spatial upscaling and optional RCAS sharpening. It uses only the current frame; this is not the temporal reconstruction used by FSR 2 or newer versions." : "NIS (NVIDIA Image Scaling) is a current-frame spatial upscaler. It does not use motion vectors, frame history, or AI reconstruction and works through Vulkan on supported GPUs.");
+                beginSelectedRow(10); ImGui::Combo("Upscaler",&g_openXrUpscaler,upscalers,2); mark(10,"Upscaler",g_openXrUpscaler==1 ? "AMD FidelityFX Super Resolution 1 uses EASU spatial upscaling and optional RCAS sharpening. It uses only the current frame; this is not the temporal reconstruction used by FSR 2 or newer versions." : "NIS (NVIDIA Image Scaling) is a current-frame spatial upscaler. It does not use motion vectors, frame history, or AI reconstruction and works through Vulkan on supported GPUs.");
                 char outputScaleText[96]={}; _snprintf_s(outputScaleText,sizeof(outputScaleText),_TRUNCATE,"Output Upscale: +%d%%",g_openXrUpscalePercent);
-                beginSelectedRow(10); ImGui::Button(outputScaleText); mark(10,"Output Upscale","Controls how much larger HatVR makes the OpenXR eye image than A Hat in Time's source image. +100% means 2x the width and 2x the height. NIS supports +25% through +100%. Changes apply live; the game's own rendering resolution is not changed.");
+                beginSelectedRow(11); ImGui::Button(outputScaleText); mark(11,"Output Upscale","Controls how much larger HatVR makes the OpenXR eye image than A Hat in Time's source image. +100% means 2x the width and 2x the height. NIS supports +25% through +100%. Changes apply live; the game's own rendering resolution is not changed.");
                 char sharpText[96]={}; _snprintf_s(sharpText,sizeof(sharpText),_TRUNCATE,"Upscaler Sharpness: %d%%",g_openXrUpscaleSharpness);
-                beginSelectedRow(11); ImGui::Button(sharpText); mark(11,"Upscaler Sharpness",g_openXrUpscaler==1 ? "Controls FSR 1 RCAS sharpening. At 0%, HatVR skips the RCAS pass entirely. Higher values increase sharpening after EASU. Use Left / Right to adjust." : "Controls NIS adaptive sharpening after spatial upscaling. Higher values can make fine edges clearer but may exaggerate aliasing or texture detail. Use Left / Right to adjust.");
+                beginSelectedRow(12); ImGui::Button(sharpText); mark(12,"Upscaler Sharpness",g_openXrUpscaler==1 ? "Controls FSR 1 RCAS sharpening. At 0%, HatVR skips the RCAS pass entirely. Higher values increase sharpening after EASU. Use Left / Right to adjust." : "Controls NIS adaptive sharpening after spatial upscaling. Higher values can make fine edges clearer but may exaggerate aliasing or texture detail. Use Left / Right to adjust.");
                 ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
                 const uint32_t sourceEyeW = g_vkLastSourceEyeWidth;
                 const uint32_t sourceEyeH = g_vkLastSourceEyeHeight;
@@ -762,7 +781,7 @@ namespace ahitvr
             }
             else if(page==2)
             {
-                ImGui::TextWrapped("Most VR controller inputs correspond directly to their standard controller counterparts. Press Y / Triangle once to open A Hat in Time's normal menu, or double-tap Y / Triangle to open the HatVR menu.");
+                ImGui::TextWrapped("Normal gamepads: double-tap Start / Options for the HatVR menu; Y / Triangle remains a normal game button. VR controllers: double-tap Y / Triangle for HatVR, or press once for the game's menu. Keyboard: double-tap Escape.");
                 ImGui::Separator();
                 check("Right-Hand Hookshot",rightHandHookshot,0,"Uses Right Grip as a Hookshot modifier and Right Trigger as X / Square. While enabled, HatVR does not send the normal right-shoulder / R button from Right Grip, which can interfere with menus or other game actions that expect that button.");
                 check("Umbrella Motion Controls",umbrellaMotionControls,1,"Swinging the right VR controller triggers the umbrella attack. Turn this off to use normal button controls without motion-triggered attacks.");
@@ -776,7 +795,7 @@ namespace ahitvr
                 char curve[80]={}; _snprintf_s(curve,sizeof(curve),_TRUNCATE,"HMD Rumble Curve: %s",curves[(g_psvr2HmdRumbleCurve>=0&&g_psvr2HmdRumbleCurve<3)?g_psvr2HmdRumbleCurve:0]);
                 beginSelectedRow(6); ImGui::Button(curve); mark(6,"HMD Rumble Curve","Controls which vibration strengths are reduced when HMD Rumble Intensity is below 100%. Linear reduces the whole range evenly. Preserve Low keeps subtle feedback stronger while compressing high values. Reduce Low suppresses small vibrations more while retaining more of strong impacts. Has no effect at 100% intensity.");
                 check("Hookshot Adaptive Trigger",g_psvr2HookshotAdaptiveTrigger,7,"Enables the PSVR2 right adaptive-trigger effect while Right-Hand Hookshot is active. This only controls the trigger effect and does not disable Right-Hand Hookshot itself.");
-                check("Eye-Controlled Hat Wheel",g_psvr2EyeWheelEnabled,8,"Uses PSVR2 eye tracking to select directions in the Hat Wheel while it is open. Physical right-stick input takes priority when used. Requires PSVR2 Toolkit.");
+                check("Eye-Controlled Hat Wheel",g_psvr2EyeWheelEnabled,8,"Maps PSVR2 gaze to a virtual circular right stick over the Hat Wheel. Outside the center deadzone the virtual stick has full strength; the physical stick always takes priority. Calibration is available under Debug Tools.");
             }
             else if(page==3)
             {
@@ -795,7 +814,7 @@ namespace ahitvr
                 const char* views[]={"Off","Left Eye","Right Eye","Both Eyes"};
                 int view=(spectatorView>=0&&spectatorView<4)?spectatorView:2;
                 beginSelectedRow(0); ImGui::Combo("Spectator View",&view,views,4);
-                mark(0,"Spectator View","Chooses what HatVR displays in A Hat in Time's desktop window. Left and Right Eye are center-cropped to fill the window. Both Eyes preserves the complete stereo pair. Off adds no spectator-specific desktop work.");
+                mark(0,"Spectator View","Chooses what HatVR displays in A Hat in Time's desktop window. Left and Right Eye are center-cropped to fill the window. Both Eyes preserves the complete stereo pair. Off clears the desktop window to black, while headset rendering continues.");
                 const char* uiModes[]={"Hidden","Overlay"};
                 int ui=(spectatorUiMode>=0&&spectatorUiMode<2)?spectatorUiMode:1;
                 beginSelectedRow(1); ImGui::Combo("VR UI",&ui,uiModes,2);
@@ -812,7 +831,7 @@ namespace ahitvr
                 ImGui::TextWrapped("Accurate OpenXR compositor mirroring is intentionally omitted; use SteamVR VR View when a runtime-accurate mirror is needed.");
                 ImGui::PopStyleColor();
             }
-            else if(page==5)
+            else if(page==5 && g_showOtherRenderers)
             {
                 ImGui::TextUnformatted("A Hat in Time Split-Screen Settings");
                 ImGui::TextWrapped("A Hat in Time lowers Environment Detail and disables Light Rays in Split Screen. These seem to be performance changes rather than fixes for rendering issues. They are completely optional in HatVR.");
@@ -826,12 +845,12 @@ namespace ahitvr
                 ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
                 ImGui::TextUnformatted("Known Graphics Issues");
                 ImGui::TextWrapped("Ambient Occlusion - Can look wrong in Stereo on some headsets. If this happens, try turning Ambient Occlusion off.");
-                ImGui::TextWrapped("Some cutscenes and effects may render incorrectly in one eye with Stereo. Synchronized Sequential is the compatibility fallback when this happens.");
+                ImGui::TextWrapped("Standard Stereo can render some effects incorrectly between eyes. Recommended is the default; turn on Show Other Renderers to access legacy modes.");
                 mark(0,"Graphics","Notes about A Hat in Time's own split-screen graphics changes and known HatVR rendering issues.");
             }
             else // Debug Tools
             {
-                ImGui::TextWrapped("Internal candidate routing tools. This page only exists when DebugToolsEnabled=1 is set in HatVR.ini.");
+                ImGui::TextWrapped("UI routing and PSVR2 eye-wheel calibration. Enable with DebugToolsEnabled=1 in HatVR.ini.");
                 ImGui::Spacing();
                 const char* preview = uiDebugPreviewMode==1 ? "SBS / Game" : (uiDebugPreviewMode==2 ? "OpenXR" : "Normal");
                 const char* route = uiDebugPermanentRoute==1 ? "SBS / Game" : (uiDebugPermanentRoute==2 ? "OpenXR" : "Unmarked");
@@ -845,6 +864,22 @@ namespace ahitvr
                 beginSelectedRow(3); ImGui::Button("Mark SBS / Game"); mark(3,"Mark SBS / Game","Keeps the selected candidate in the normal game framebuffer.");
                 beginSelectedRow(4); ImGui::Button("Mark OpenXR"); mark(4,"Mark OpenXR","Routes the selected candidate into the detached OpenXR UI panel.");
                 beginSelectedRow(5); ImGui::Button("Clear Mark"); mark(5,"Clear Mark","Clears the manual route and returns to built-in handling.");
+                ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+                ImGui::TextDisabled("Eye Wheel Calibration (PSVR2)");
+                char eyeOpt[96] = {};
+                _snprintf_s(eyeOpt,sizeof(eyeOpt),_TRUNCATE,"Wheel Center X: %+d%%",g_psvr2EyeWheelOffsetX);
+                beginSelectedRow(6); ImGui::Button(eyeOpt); mark(6,"Wheel Center X","Moves the center of the virtual stick circle horizontally across the game HUD. Positive moves it right; adjust until the debug circle aligns with the Hat Wheel. Left / Right changes by 5%%.");
+                _snprintf_s(eyeOpt,sizeof(eyeOpt),_TRUNCATE,"Wheel Center Y: %+d%%",g_psvr2EyeWheelOffsetY);
+                beginSelectedRow(7); ImGui::Button(eyeOpt); mark(7,"Wheel Center Y","Moves the virtual circle up/down on the game HUD. Positive moves it up. Left / Right changes by 5%%.");
+                _snprintf_s(eyeOpt,sizeof(eyeOpt),_TRUNCATE,"Wheel Circle Radius: %d%%",g_psvr2EyeWheelRadius);
+                beginSelectedRow(8); ImGui::Button(eyeOpt); mark(8,"Wheel Circle Radius","Radius as a percent of the HUD's half-height. The virtual stick uses a physically round circle, independent of widescreen stretching. Align the outer ring with the Hat Wheel. Left / Right changes by 5%%.");
+                _snprintf_s(eyeOpt,sizeof(eyeOpt),_TRUNCATE,"Center Deadzone: %d%%",g_psvr2EyeWheelDeadzone);
+                beginSelectedRow(9); ImGui::Button(eyeOpt); mark(9,"Center Deadzone","Inner neutral circle as a percentage of the calibrated wheel circle radius. Looking outside selects with full stick strength. Left / Right changes by 5%%.");
+                _snprintf_s(eyeOpt,sizeof(eyeOpt),_TRUNCATE,"Gaze Stability: %d%%",g_psvr2EyeWheelStability);
+                beginSelectedRow(10); ImGui::Button(eyeOpt); mark(10,"Gaze Stability","Higher values smooth jitter but respond more slowly. The stick remains full strength outside the deadzone. Left / Right changes by 5%%.");
+                check("Eye Wheel Debug Overlay",g_psvr2EyeWheelDebugVisuals,11,"Displays the virtual stick circle, neutral zone, gaze position and resulting stick direction directly over the game HUD whenever the Hat Wheel is open. PSVR2 testing aid; disabled by default.");
+                beginSelectedRow(12); ImGui::Button("Reset Eye Wheel Calibration"); mark(12,"Reset Eye Wheel Calibration","Restores the virtual circle's center, radius, deadzone and smoothing defaults. Leaves the optional debug overlay setting unchanged.");
+
             }
             if(!insideCategory)
             {
@@ -857,6 +892,73 @@ namespace ahitvr
             ImGui::EndChild();
             ImGui::EndGroup();
             ImGui::End();
+            ImGui::Render();
+        }
+
+        // PSVR2 eye-wheel calibration drawn as a transparent OpenXR quad aligned
+        // to the game's HUD quad. Nothing is added to the actual game UI texture
+        // or stereo world image. Coordinates are normalized HUD panel [-1,+1].
+        void BuildHatVrEyeWheelDebugOverlay(const HatVrEyeWheelDebugSample& sample)
+        {
+            constexpr float W=900.0f, H=760.0f;
+            ImGuiIO& io=ImGui::GetIO();
+            io.DisplaySize={W,H}; io.DeltaTime=1.0f/90.0f;
+            ImGui_ImplVulkan_NewFrame(); ImGui::NewFrame();
+            ImDrawList* draw=ImGui::GetForegroundDrawList();
+            const float cx=(1.0f+(float)g_psvr2EyeWheelOffsetX*0.01f)*W*0.5f;
+            const float cy=(1.0f-(float)g_psvr2EyeWheelOffsetY*0.01f)*H*0.5f;
+            const float radiusY=(float)g_psvr2EyeWheelRadius*0.01f;
+            // HUD quad width:height = 1.60:0.90. Use a physically circular
+            // ring, although the 900x760 debug swapchain is itself not 16:9.
+            const float rx=radiusY*(0.45f/0.80f)*W*0.5f;
+            const float ry=radiusY*H*0.5f;
+            const float dz=(float)g_psvr2EyeWheelDeadzone*0.01f;
+            const ImVec2 c{cx,cy};
+            auto drawRing=[&](float k, ImU32 color, float thickness)
+            {
+                constexpr int segments=72;
+                ImVec2 pts[segments+1];
+                for(int i=0;i<=segments;++i)
+                {
+                    const float a=6.28318530718f*(float)i/(float)segments;
+                    pts[i]={cx+rx*k*cosf(a),cy+ry*k*sinf(a)};
+                }
+                draw->AddPolyline(pts,segments+1,color,ImDrawFlags_None,thickness);
+            };
+            // Color legend: cyan outer circle, amber neutral, magenta raw gaze,
+            // white filtered gaze, green output arrow.
+            drawRing(1.0f,IM_COL32(65,235,255,235),2.8f);
+            drawRing(dz,IM_COL32(255,185,50,235),2.6f);
+            draw->AddLine({cx-10,cy},{cx+10,cy},IM_COL32(255,255,255,190),1.5f);
+            draw->AddLine({cx,cy-10},{cx,cy+10},IM_COL32(255,255,255,190),1.5f);
+            char label[256]{};
+            _snprintf_s(label,sizeof(label),_TRUNCATE,
+                "PSVR2 eye wheel | center %+d%%,%+d%%  radius %d%%  deadzone %d%%",
+                g_psvr2EyeWheelOffsetX,g_psvr2EyeWheelOffsetY,
+                g_psvr2EyeWheelRadius,g_psvr2EyeWheelDeadzone);
+            draw->AddText({12,12},IM_COL32(255,255,255,250),label);
+            draw->AddText({12,36},IM_COL32(150,236,255,255),"Cyan: calibrated circle  Amber: deadzone");
+            draw->AddText({12,60},IM_COL32(255,170,232,255),"Magenta: raw gaze  White: filtered gaze  Green: stick");
+            if(sample.gazeValid)
+            {
+                const ImVec2 raw{(1.0f+sample.rawX)*W*0.5f,(1.0f-sample.rawY)*H*0.5f};
+                const ImVec2 filtered{(1.0f+sample.smoothX)*W*0.5f,(1.0f-sample.smoothY)*H*0.5f};
+                draw->AddCircleFilled(raw,5.5f,IM_COL32(255,65,205,255),20);
+                draw->AddCircle(filtered,6.5f,IM_COL32(255,255,255,255),20,2.5f);
+                if(sample.stickX*sample.stickX+sample.stickY*sample.stickY > 0.02f)
+                {
+                    const ImVec2 target{cx+sample.stickX*rx,cy-sample.stickY*ry};
+                    draw->AddLine(c,target,IM_COL32(85,255,110,255),3.5f);
+                    draw->AddCircleFilled(target,6.0f,IM_COL32(85,255,110,255),20);
+                }
+                _snprintf_s(label,sizeof(label),_TRUNCATE,
+                    "Gaze %.2f, %.2f    Stick %.2f, %.2f",
+                    sample.smoothX,sample.smoothY,sample.stickX,sample.stickY);
+                draw->AddText({12,H-32},IM_COL32(255,255,255,255),label);
+            }
+            else
+                draw->AddText({12,H-32},IM_COL32(255,160,80,255),
+                    "Hat Wheel open - waiting for valid PSVR2 gaze");
             ImGui::Render();
         }
 
@@ -874,7 +976,8 @@ namespace ahitvr
             ImGui::Begin("##HatVrStartupHint",nullptr,
                 ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_AlwaysAutoResize|
                 ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoSavedSettings);
-            ImGui::TextUnformatted("Double-tap Y / Triangle to open the HatVR menu");
+                ImGui::TextUnformatted("Double Start / Options: HatVR menu (gamepad)");
+                ImGui::TextUnformatted("Double Y / Triangle: HatVR menu (VR controllers)");
             ImGui::End();
             ImGui::Render();
         }
@@ -1082,6 +1185,14 @@ namespace ahitvr
                 D3DSURFACE_DESC sd{};
                 if (SUCCEEDED(src->GetDesc(&sd)))
                 {
+                    const UINT croppedHeight = (g_vkCropNewSequentialStereoUi16x9 && sd.Width >= 16)
+                        ? static_cast<UINT>(
+                            (static_cast<unsigned long long>(sd.Width) * 9ull + 8ull) / 16ull)
+                        : 0;
+                    const bool doCrop = croppedHeight > 0 && croppedHeight <= sd.Height;
+                    if (sd.Width && sd.Height)
+                        g_vkLastUiSourceAspect = static_cast<float>(sd.Width) /
+                            static_cast<float>(doCrop ? croppedHeight : sd.Height);
                     // AHiT UI is its own compositor layer.  It is NOT an AFR eye.
                     // the redirected UE3 Canvas/UI target is a complete full-width
                     // UI canvas and should be retained as one mono image, then shown
@@ -1091,7 +1202,11 @@ namespace ahitvr
                     //
                     // keep AFR exclusively in the world-eye textures.  The UI path
                     // always consumes the complete canvas, regardless of render mode.
-                    RECT r{0,0,(LONG)sd.Width,(LONG)sd.Height};
+                    // Sample only the portion of the retained UI target in
+                    // which the cropped 16:9 Canvas was rasterized. Both source
+                    // area and panel aspect now agree; no post-crop truncation.
+                    RECT r{0,0,(LONG)sd.Width,
+                        (LONG)(doCrop ? croppedHeight : sd.Height)};
                     ok = SUCCEEDED(device->StretchRect(
                         src,&r,dst,nullptr,D3DTEXF_LINEAR));
                 }
@@ -1102,16 +1217,6 @@ namespace ahitvr
             return ok;
         }
 
-        struct VkBridgeTimingSample
-        {
-            double getRenderTargetDataMs = 0.0;
-            double lockCopyMs = 0.0;
-            double uploadMemcpyMs = 0.0;
-            double uploadGpuMs = 0.0;
-        };
-
-        VkBridgeTimingSample g_vkBridgeTiming[3];
-
         double QpcElapsedMs(const LARGE_INTEGER& begin, const LARGE_INTEGER& end)
         {
             static LARGE_INTEGER freq = [] {
@@ -1120,189 +1225,6 @@ namespace ahitvr
                 return f;
             }();
             return (double(end.QuadPart - begin.QuadPart) * 1000.0) / double(freq.QuadPart);
-        }
-
-        bool ReadD3D9TextureBGRA(
-            IDirect3DTexture9* texture, UINT width, UINT height,
-            std::vector<unsigned char>& pixels, int cacheSlot)
-        {
-            if (!texture || !width || !height || cacheSlot < 0 || cacheSlot > 1)
-                return false;
-
-            IDirect3DDevice9* device = nullptr;
-            IDirect3DSurface9* src = nullptr;
-            bool ok = false;
-            if (FAILED(texture->GetDevice(&device)) || !device) goto done;
-            if (FAILED(texture->GetSurfaceLevel(0, &src)) || !src) goto done;
-
-            D3DSURFACE_DESC desc{};
-            if (FAILED(src->GetDesc(&desc))) goto done;
-            if (desc.Width != width || desc.Height != height) goto done;
-            if (desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8)
-                goto done;
-
-            auto& c = g_vkReadbackCache[cacheSlot];
-            if (!c.surface || c.width != width || c.height != height || c.format != desc.Format)
-            {
-                if (c.surface) c.surface->Release();
-                c = {};
-                if (FAILED(device->CreateOffscreenPlainSurface(
-                    width, height, desc.Format, D3DPOOL_SYSTEMMEM,
-                    &c.surface, nullptr)) || !c.surface)
-                    goto done;
-                c.width = width; c.height = height; c.format = desc.Format;
-                DxvkPathTrace("VKXR-V8 readback cache[%d] READY %ux%u", cacheSlot,width,height);
-            }
-
-            LARGE_INTEGER tRead0{}, tRead1{}, tCopy1{};
-            QueryPerformanceCounter(&tRead0);
-            if (FAILED(device->GetRenderTargetData(src, c.surface))) goto done;
-            QueryPerformanceCounter(&tRead1);
-            D3DLOCKED_RECT lr{};
-            if (FAILED(c.surface->LockRect(&lr, nullptr, D3DLOCK_READONLY))) goto done;
-
-            const size_t bytes = size_t(width) * size_t(height) * 4u;
-            if (pixels.size() != bytes) pixels.resize(bytes);
-            for (UINT y=0; y<height; ++y)
-                std::memcpy(pixels.data()+size_t(y)*width*4u,
-                    static_cast<const unsigned char*>(lr.pBits)+size_t(y)*lr.Pitch,
-                    size_t(width)*4u);
-            c.surface->UnlockRect();
-            QueryPerformanceCounter(&tCopy1);
-            g_vkBridgeTiming[cacheSlot].getRenderTargetDataMs = QpcElapsedMs(tRead0, tRead1);
-            g_vkBridgeTiming[cacheSlot].lockCopyMs = QpcElapsedMs(tRead1, tCopy1);
-            ok = true;
-        done:
-            if (src) src->Release();
-            if (device) device->Release();
-            return ok;
-        }
-
-
-        // Returns true only when a new menu image was submitted. Never waits.
-
-        bool UploadPixelsToImage(
-            const std::vector<unsigned char>& pixels,
-            uint32_t width, uint32_t height,
-            VkImage image, int cacheSlot)
-        {
-            if (pixels.empty() || !image || !EnsureCommandResources() ||
-                cacheSlot < 0 || cacheSlot > 2)
-                return false;
-
-            const VkDeviceSize byteCount = VkDeviceSize(pixels.size());
-            auto& c = g_vkUploadCache[cacheSlot];
-            if (!c.buffer || c.capacity < byteCount)
-            {
-                if (c.mapped && c.memory) vkUnmapMemory(g_vkDevice,c.memory);
-                if (c.buffer) vkDestroyBuffer(g_vkDevice,c.buffer,nullptr);
-                if (c.memory) vkFreeMemory(g_vkDevice,c.memory,nullptr);
-                c = {};
-
-                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-                bci.size = byteCount;
-                bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-                bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-                if (vkCreateBuffer(g_vkDevice,&bci,nullptr,&c.buffer) != VK_SUCCESS)
-                    return false;
-                VkMemoryRequirements mr{};
-                vkGetBufferMemoryRequirements(g_vkDevice,c.buffer,&mr);
-                const uint32_t mt=FindMemoryType(mr.memoryTypeBits,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                if (mt==UINT32_MAX) return false;
-                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                mai.allocationSize=mr.size; mai.memoryTypeIndex=mt;
-                if (vkAllocateMemory(g_vkDevice,&mai,nullptr,&c.memory)!=VK_SUCCESS) return false;
-                if (vkBindBufferMemory(g_vkDevice,c.buffer,c.memory,0)!=VK_SUCCESS) return false;
-                if (vkMapMemory(g_vkDevice,c.memory,0,VK_WHOLE_SIZE,0,&c.mapped)!=VK_SUCCESS) return false;
-                c.capacity=mr.size;
-                DxvkPathTrace("VKXR-V8 upload cache[%d] READY bytes=%llu",
-                    cacheSlot,(unsigned long long)c.capacity);
-            }
-            LARGE_INTEGER tUpload0{}, tUploadCopy1{}, tUploadGpu1{};
-            QueryPerformanceCounter(&tUpload0);
-            std::memcpy(c.mapped,pixels.data(),pixels.size());
-            QueryPerformanceCounter(&tUploadCopy1);
-            VkBuffer buffer=c.buffer;
-
-            vkResetFences(g_vkDevice, 1, &g_vkFence);
-            vkResetCommandBuffer(g_vkCommandBuffer, 0);
-
-            VkCommandBufferBeginInfo cbi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            if (vkBeginCommandBuffer(g_vkCommandBuffer, &cbi) != VK_SUCCESS)
-                goto fail;
-
-            VkImageMemoryBarrier toTransfer{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-            // OpenXR Vulkan swapchain color images are handed to us in a
-            // layout compatible with COLOR_ATTACHMENT_OPTIMAL after Wait.
-            // Preserve that contract rather than pretending the contents/layout
-            // are undefined.
-            toTransfer.srcAccessMask =
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toTransfer.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toTransfer.image = image;
-            toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            toTransfer.subresourceRange.baseMipLevel = 0;
-            toTransfer.subresourceRange.levelCount = 1;
-            toTransfer.subresourceRange.baseArrayLayer = 0;
-            toTransfer.subresourceRange.layerCount = 1;
-
-            vkCmdPipelineBarrier(
-                g_vkCommandBuffer,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &toTransfer);
-
-            VkBufferImageCopy copy{};
-            copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copy.imageSubresource.mipLevel = 0;
-            copy.imageSubresource.baseArrayLayer = 0;
-            copy.imageSubresource.layerCount = 1;
-            copy.imageExtent = { width, height, 1 };
-            vkCmdCopyBufferToImage(
-                g_vkCommandBuffer, buffer, image,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-            VkImageMemoryBarrier toColor{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-            toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-            toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toColor.image = image;
-            toColor.subresourceRange = toTransfer.subresourceRange;
-
-            vkCmdPipelineBarrier(
-                g_vkCommandBuffer,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &toColor);
-
-            if (vkEndCommandBuffer(g_vkCommandBuffer) != VK_SUCCESS)
-                goto fail;
-
-            VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &g_vkCommandBuffer;
-            if (vkQueueSubmit(g_vkQueue, 1, &si, g_vkFence) != VK_SUCCESS)
-                goto fail;
-            if (vkWaitForFences(g_vkDevice, 1, &g_vkFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-                goto fail;
-            QueryPerformanceCounter(&tUploadGpu1);
-            g_vkBridgeTiming[cacheSlot].uploadMemcpyMs = QpcElapsedMs(tUpload0, tUploadCopy1);
-            g_vkBridgeTiming[cacheSlot].uploadGpuMs = QpcElapsedMs(tUploadCopy1, tUploadGpu1);
-
-            return true;
-
-        fail:
-            return false;
         }
 
         // NIS (NVIDIA Image Scaling) resources live on HatVR's OpenXR Vulkan device.
@@ -1573,8 +1495,9 @@ namespace ahitvr
             return srcView;
         }
 
-        // DXVK copies its D3D9 VkImage into an exportable Win32-memory image; HatVR's
-        // OpenXR VkDevice imports that allocation and copies it into the XR swapchain.
+        // Always separate DXVK and OpenXR logical devices. DXVK's D3D9 VkImage
+        // is blitted into an exportable Win32-memory image. The OpenXR-owned
+        // VkDevice imports the same GPU allocation and copies into XR swapchains.
         struct Phase6EyeBridge
         {
             VkImage dxvkImage = VK_NULL_HANDLE;
@@ -1608,6 +1531,81 @@ namespace ahitvr
             return UINT32_MAX;
         }
 
+        // Physical VkPhysicalDevice handles from different VkInstances are NOT
+        // comparable. External Win32 memory must originate on the same underlying
+        // adapter. Vulkan 1.1 deviceUUID is stable across the two instances.
+        bool ValidateBridgeAdapterIdentity()
+        {
+            if (!g_dxvkProbePhysical || !g_vkPhysicalDevice) return false;
+            VkPhysicalDeviceIDProperties dxId{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+            VkPhysicalDeviceIDProperties xrId{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+            VkPhysicalDeviceProperties2 dxProps{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            VkPhysicalDeviceProperties2 xrProps{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            dxProps.pNext = &dxId;
+            xrProps.pNext = &xrId;
+            vkGetPhysicalDeviceProperties2(g_dxvkProbePhysical, &dxProps);
+            vkGetPhysicalDeviceProperties2(g_vkPhysicalDevice, &xrProps);
+            const bool same = std::memcmp(dxId.deviceUUID, xrId.deviceUUID, VK_UUID_SIZE) == 0 &&
+                dxProps.properties.vendorID == xrProps.properties.vendorID &&
+                dxProps.properties.deviceID == xrProps.properties.deviceID;
+            DxvkPathTrace("VKBRIDGE-ADAPTER DXVK='%s' vendor=%04X device=%04X XR='%s' vendor=%04X device=%04X uuidMatch=%d",
+                dxProps.properties.deviceName, dxProps.properties.vendorID, dxProps.properties.deviceID,
+                xrProps.properties.deviceName, xrProps.properties.vendorID, xrProps.properties.deviceID,
+                same ? 1 : 0);
+            if (!same)
+                DxvkPathTrace("VKBRIDGE-ADAPTER FAILED: separate devices do not use the same physical GPU; cross-GPU opaque Win32 import prohibited");
+            return same;
+        }
+
+        // Query external-memory support for precisely the bridge image format,
+        // usage and handle type used below. GPU bridge fails explicitly when a
+        // runtime/driver cannot import the selected external allocation.
+        bool SupportsBridgeImage(VkPhysicalDevice physical, VkExternalMemoryFeatureFlags needed,
+            const char* side)
+        {
+            VkPhysicalDeviceExternalImageFormatInfo externalQuery{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO };
+            externalQuery.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+            VkPhysicalDeviceImageFormatInfo2 imageQuery{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 };
+            imageQuery.pNext = &externalQuery;
+            imageQuery.format = VK_FORMAT_B8G8R8A8_UNORM;
+            imageQuery.type = VK_IMAGE_TYPE_2D;
+            imageQuery.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageQuery.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            VkExternalImageFormatProperties externalProps{
+                VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+            VkImageFormatProperties2 props{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 };
+            props.pNext = &externalProps;
+            const VkResult result = vkGetPhysicalDeviceImageFormatProperties2(physical, &imageQuery, &props);
+            const auto& memory = externalProps.externalMemoryProperties;
+            const bool supported = result == VK_SUCCESS &&
+                (memory.externalMemoryFeatures & needed) == needed &&
+                (memory.compatibleHandleTypes & externalQuery.handleType) != 0;
+            DxvkPathTrace("VKBRIDGE-CAPABILITIES side=%s vk=%d externalFeatures=0x%X compatible=0x%X required=0x%X supported=%d",
+                side, (int)result, memory.externalMemoryFeatures,
+                memory.compatibleHandleTypes, needed, supported ? 1 : 0);
+            return supported;
+        }
+
+        bool SupportsBridgeSemaphore(VkPhysicalDevice physical,
+            VkExternalSemaphoreFeatureFlags needed, const char* side)
+        {
+            VkPhysicalDeviceExternalSemaphoreInfo query{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO };
+            query.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+            VkExternalSemaphoreProperties props{
+                VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+            vkGetPhysicalDeviceExternalSemaphoreProperties(physical, &query, &props);
+            const bool supported = (props.externalSemaphoreFeatures & needed) == needed &&
+                (props.compatibleHandleTypes & query.handleType) != 0;
+            DxvkPathTrace("VKBRIDGE-SYNC-CAPABILITIES side=%s features=0x%X compatible=0x%X required=0x%X supported=%d",
+                side, props.externalSemaphoreFeatures, props.compatibleHandleTypes,
+                needed, supported ? 1 : 0);
+            return supported;
+        }
+
         bool EnsurePhase6DxvkCommands()
         {
             if (g_phase6DxvkCommandPool && g_phase6DxvkCommandBuffer && g_phase6DxvkFence) return true;
@@ -1622,6 +1620,7 @@ namespace ahitvr
             cai.commandBufferCount = 1;
             if (vkAllocateCommandBuffers(g_dxvkProbeDevice, &cai, &g_phase6DxvkCommandBuffer) != VK_SUCCESS) return false;
             VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // first reuse wait must not block
             if (vkCreateFence(g_dxvkProbeDevice, &fci, nullptr, &g_phase6DxvkFence) != VK_SUCCESS) return false;
             return true;
         }
@@ -1664,8 +1663,10 @@ namespace ahitvr
             if (!g_dxvkProbeDevice || !g_dxvkProbePhysical || !g_vkDevice || !g_vkPhysicalDevice) return false;
             if (!EnsurePhase6DxvkCommands()) return false;
             auto phase6Fail = [&]() -> bool {
-                DxvkPathTrace("VKBRIDGE-V5 PHASE6 SHARED-IMAGE FAILED slot=%d; CPU fallback is DISABLED", slot);
+                DxvkPathTrace("VKBRIDGE-INIT FAILED slot=%d extent=%ux%u; direct GPU transfer unavailable, CPU fallback DISABLED",
+                    slot, width, height);
                 g_phase6Unavailable = true;
+                DestroyPhase6EyeBridge(slot);
                 return false;
             };
 
@@ -1682,7 +1683,8 @@ namespace ahitvr
             ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
             ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            if (vkCreateImage(g_dxvkProbeDevice, &ici, nullptr, &b.dxvkImage) != VK_SUCCESS) return phase6Fail();
+            VkResult bridgeVk = vkCreateImage(g_dxvkProbeDevice, &ici, nullptr, &b.dxvkImage);
+            if (bridgeVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-INIT stage=dxvk-create-image vk=%d", (int)bridgeVk); return phase6Fail(); }
 
             VkMemoryRequirements mr{};
             vkGetImageMemoryRequirements(g_dxvkProbeDevice, b.dxvkImage, &mr);
@@ -1695,8 +1697,10 @@ namespace ahitvr
             dedicated.image = b.dxvkImage;
             VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
             mai.pNext = &dedicated; mai.allocationSize = mr.size; mai.memoryTypeIndex = dxType;
-            if (vkAllocateMemory(g_dxvkProbeDevice, &mai, nullptr, &b.dxvkMemory) != VK_SUCCESS) return phase6Fail();
-            if (vkBindImageMemory(g_dxvkProbeDevice, b.dxvkImage, b.dxvkMemory, 0) != VK_SUCCESS) return phase6Fail();
+            bridgeVk = vkAllocateMemory(g_dxvkProbeDevice, &mai, nullptr, &b.dxvkMemory);
+            if (bridgeVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-INIT stage=dxvk-export-allocate vk=%d", (int)bridgeVk); return phase6Fail(); }
+            bridgeVk = vkBindImageMemory(g_dxvkProbeDevice, b.dxvkImage, b.dxvkMemory, 0);
+            if (bridgeVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-INIT stage=dxvk-bind-image vk=%d", (int)bridgeVk); return phase6Fail(); }
 
             auto dxGetMemHandle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(vkGetDeviceProcAddr(g_dxvkProbeDevice, "vkGetMemoryWin32HandleKHR"));
             if (!dxGetMemHandle) {
@@ -1713,7 +1717,7 @@ namespace ahitvr
 
             // OPAQUE_WIN32 handles are deliberately opaque. Vulkan explicitly forbids
             // vkGetMemoryWin32HandlePropertiesKHR for opaque handle types, so do NOT query it.
-            // Both logical devices are on the same physical NVIDIA adapter; use the exporter's
+            // Verified same-adapter logical devices share memory-type indices. Use the exporter's
             // memory type when that type is also valid for the import-side image requirements.
             VkResult xrCreateBridgeImageResult = vkCreateImage(g_vkDevice, &ici, nullptr, &b.xrImage);
             if (xrCreateBridgeImageResult != VK_SUCCESS) {
@@ -1747,26 +1751,31 @@ namespace ahitvr
                 DxvkPathTrace("VKBRIDGE-V5 PHASE6 FAIL slot=%d stage=xr-vkAllocateMemory-import result=%d", slot, (int)xrAllocImportResult);
                 return phase6Fail();
             }
-            if (vkBindImageMemory(g_vkDevice, b.xrImage, b.xrMemory, 0) != VK_SUCCESS) return phase6Fail();
+            bridgeVk = vkBindImageMemory(g_vkDevice, b.xrImage, b.xrMemory, 0);
+            if (bridgeVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-INIT stage=xr-bind-import vk=%d", (int)bridgeVk); return phase6Fail(); }
 
             // Export one binary semaphore from DXVK and import it into the XR device.
             VkExportSemaphoreCreateInfo es{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
             es.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
             VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
             sci.pNext = &es;
-            if (vkCreateSemaphore(g_dxvkProbeDevice, &sci, nullptr, &b.dxvkSemaphore) != VK_SUCCESS) return phase6Fail();
+            bridgeVk = vkCreateSemaphore(g_dxvkProbeDevice, &sci, nullptr, &b.dxvkSemaphore);
+            if (bridgeVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-INIT stage=dxvk-export-semaphore vk=%d", (int)bridgeVk); return phase6Fail(); }
             auto dxGetSemHandle = reinterpret_cast<PFN_vkGetSemaphoreWin32HandleKHR>(vkGetDeviceProcAddr(g_dxvkProbeDevice, "vkGetSemaphoreWin32HandleKHR"));
             auto xrImportSem = reinterpret_cast<PFN_vkImportSemaphoreWin32HandleKHR>(vkGetDeviceProcAddr(g_vkDevice, "vkImportSemaphoreWin32HandleKHR"));
-            if (!dxGetSemHandle || !xrImportSem) return phase6Fail();
+            if (!dxGetSemHandle || !xrImportSem) { DxvkPathTrace("VKBRIDGE-INIT stage=external-semaphore-procs dxvk=%d xr=%d", dxGetSemHandle?1:0, xrImportSem?1:0); return phase6Fail(); }
             VkSemaphoreGetWin32HandleInfoKHR sghi{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
             sghi.semaphore = b.dxvkSemaphore; sghi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-            if (dxGetSemHandle(g_dxvkProbeDevice, &sghi, &b.semaphoreHandle) != VK_SUCCESS || !b.semaphoreHandle) return phase6Fail();
+            bridgeVk = dxGetSemHandle(g_dxvkProbeDevice, &sghi, &b.semaphoreHandle);
+            if (bridgeVk != VK_SUCCESS || !b.semaphoreHandle) { DxvkPathTrace("VKBRIDGE-INIT stage=export-semaphore-handle vk=%d", (int)bridgeVk); return phase6Fail(); }
             VkSemaphoreCreateInfo xsci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-            if (vkCreateSemaphore(g_vkDevice, &xsci, nullptr, &b.xrSemaphore) != VK_SUCCESS) return phase6Fail();
+            bridgeVk = vkCreateSemaphore(g_vkDevice, &xsci, nullptr, &b.xrSemaphore);
+            if (bridgeVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-INIT stage=xr-semaphore vk=%d", (int)bridgeVk); return phase6Fail(); }
             VkImportSemaphoreWin32HandleInfoKHR ishi{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
             ishi.semaphore = b.xrSemaphore; ishi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
             ishi.handle = b.semaphoreHandle;
-            if (xrImportSem(g_vkDevice, &ishi) != VK_SUCCESS) return phase6Fail();
+            bridgeVk = xrImportSem(g_vkDevice, &ishi);
+            if (bridgeVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-INIT stage=import-semaphore-handle vk=%d", (int)bridgeVk); return phase6Fail(); }
 
             b.width = width; b.height = height; b.initialized = true;
             DxvkPathTrace("VKBRIDGE-V5 PHASE6 SHARED-IMAGE READY slot=%d %ux%u dxImage=%p xrImage=%p (GPU-only)",
@@ -1782,7 +1791,7 @@ namespace ahitvr
             if(wantNis && g_openXrUpscaler==1 && !EnsureFsrOutput(dstWidth,dstHeight)) wantNis=false;
             const uint32_t bridgeW = wantNis ? srcWidth : dstWidth;
             const uint32_t bridgeH = wantNis ? srcHeight : dstHeight;
-            if (!texture || !dstImage || g_vkUsingDxvkDevice || !EnsurePhase6EyeBridge(slot, bridgeW, bridgeH) || !EnsureCommandResources())
+            if (!texture || !dstImage || !EnsurePhase6EyeBridge(slot, bridgeW, bridgeH) || !EnsureCommandResources())
                 return false;
             auto& b = g_phase6Eye[slot];
             ID3D9VkInteropTextureHatVR* texInterop = nullptr;
@@ -1790,6 +1799,8 @@ namespace ahitvr
             ID3D9VkInteropDevicePhase5* devInterop = nullptr;
             VkImage srcImage = VK_NULL_HANDLE; VkImageLayout srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkImageCreateInfo srcInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+            VkResult producerWait = VK_SUCCESS;
+            bool bridgeCommandsTouched = false;
             if (FAILED(texture->QueryInterface(__uuidof(ID3D9VkInteropTextureHatVR), reinterpret_cast<void**>(&texInterop))) || !texInterop) goto fail;
             if (FAILED(texture->GetDevice(&d3dDevice)) || !d3dDevice) goto fail;
             if (FAILED(d3dDevice->QueryInterface(__uuidof(ID3D9VkInteropDevicePhase5), reinterpret_cast<void**>(&devInterop))) || !devInterop) goto fail;
@@ -1814,6 +1825,17 @@ namespace ahitvr
 
             // Stage A: DXVK queue copies source texture -> shared image, then releases it externally.
             devInterop->LockSubmissionQueue();
+            // A previous XR-queue wait consumes the cross-device semaphore,
+            // but the DXVK submission fence must independently be signaled
+            // before Vulkan permits us to reset/reuse it.
+            producerWait = vkWaitForFences(g_dxvkProbeDevice, 1,
+                &g_phase6DxvkFence, VK_TRUE, UINT64_MAX);
+            if (producerWait != VK_SUCCESS) {
+                bridgeCommandsTouched = true; // unknown producer fence state; no blind retry
+                DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=dxvk-fence-wait slot=%d vk=%d", slot, (int)producerWait);
+                goto dx_locked_fail;
+            }
+            bridgeCommandsTouched = true; // resetting the fence makes a retry unsafe without a full rebuild
             vkResetFences(g_dxvkProbeDevice, 1, &g_phase6DxvkFence);
             vkResetCommandBuffer(g_phase6DxvkCommandBuffer, 0);
             {
@@ -1963,7 +1985,8 @@ namespace ahitvr
                 vkCmdPipelineBarrier(g_phase6DxvkCommandBuffer,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,2,post);
                 if (vkEndCommandBuffer(g_phase6DxvkCommandBuffer)!=VK_SUCCESS) goto dx_locked_fail;
                 VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&g_phase6DxvkCommandBuffer; si.signalSemaphoreCount=1; si.pSignalSemaphores=&b.dxvkSemaphore;
-                if (vkQueueSubmit(g_dxvkProbeQueue,1,&si,g_phase6DxvkFence)!=VK_SUCCESS) goto dx_locked_fail;
+                VkResult submitVk = vkQueueSubmit(g_dxvkProbeQueue,1,&si,g_phase6DxvkFence);
+                if (submitVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=dxvk-submit slot=%d vk=%d", slot, (int)submitVk); goto dx_locked_fail; }
             }
             devInterop->ReleaseSubmissionQueue();
 
@@ -1993,154 +2016,39 @@ namespace ahitvr
                 if(vkEndCommandBuffer(g_vkCommandBuffer)!=VK_SUCCESS) goto fail;
                 VkPipelineStageFlags waitStage=VK_PIPELINE_STAGE_TRANSFER_BIT;
                 VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.waitSemaphoreCount=1; si.pWaitSemaphores=&b.xrSemaphore; si.pWaitDstStageMask=&waitStage; si.commandBufferCount=1; si.pCommandBuffers=&g_vkCommandBuffer;
-                if(vkQueueSubmit(g_vkQueue,1,&si,g_vkFence)!=VK_SUCCESS) goto fail;
-                if(vkWaitForFences(g_vkDevice,1,&g_vkFence,VK_TRUE,UINT64_MAX)!=VK_SUCCESS) goto fail;
+                VkResult xrSubmitVk = vkQueueSubmit(g_vkQueue,1,&si,g_vkFence);
+                if(xrSubmitVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=xr-submit slot=%d vk=%d", slot, (int)xrSubmitVk); goto fail; }
+                VkResult xrFenceVk = vkWaitForFences(g_vkDevice,1,&g_vkFence,VK_TRUE,UINT64_MAX);
+                if(xrFenceVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=xr-fence-wait slot=%d vk=%d", slot, (int)xrFenceVk); goto fail; }
                 if(nisTempView) vkDestroyImageView(g_vkDevice,nisTempView,nullptr);
             }
             b.externalOwnedByXr=true;
             if(!g_phase6LoggedActive){ DxvkPathTrace("VKBRIDGE-V5 PHASE8 DIRECT-SBS GPU-ONLY ACTIVE - original SBS VkImage, no D3D9 eye StretchRects, no CPU pixels"); g_phase6LoggedActive=true; }
-            if (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL)==0)
+            if (g_debugToolsEnabled && (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL)==0))
                 DxvkPathTrace("VKBRIDGE-V5 PHASE8 GPU-COPY slot=%d directSbs=%d src=%p srcExtent=%ux%u shared=%p xrShared=%p dst=%p eye=%ux%u",slot,directSbs?1:0,srcImage,srcInfo.extent.width,srcInfo.extent.height,b.dxvkImage,b.xrImage,dstImage,dstWidth,dstHeight);
             devInterop->Release(); d3dDevice->Release(); texInterop->Release(); return true;
         dx_locked_fail:
             devInterop->ReleaseSubmissionQueue();
         fail:
+            // An interop texture may be temporarily unavailable before any
+            // Vulkan work starts: retry next frame. Once commands or the DXVK
+            // fence have been touched, semaphore/ownership state is uncertain;
+            // fail closed instead of blindly resubmitting.
+            if (bridgeCommandsTouched)
+            {
+                if (!g_phase6Unavailable)
+                    DxvkPathTrace("VKBRIDGE-TRANSFER FATAL slot=%d source=%ux%u dest=%ux%u; GPU bridge disabled for this session (no CPU fallback)",
+                        slot, srcWidth, srcHeight, dstWidth, dstHeight);
+                g_phase6Unavailable = true;
+            }
+            else
+            {
+                static unsigned int transientBridgeWarnings = 0;
+                if (++transientBridgeWarnings <= 5 || (transientBridgeWarnings % 300) == 0)
+                    DxvkPathTrace("VKBRIDGE-TRANSFER pre-submit unavailable slot=%d source=%ux%u (retrying)",
+                        slot, srcWidth, srcHeight);
+            }
             if(devInterop)devInterop->Release(); if(d3dDevice)d3dDevice->Release(); if(texInterop)texInterop->Release();
-            return false;
-        }
-
-        bool CopyDxvkTextureToOpenXrImage(
-            IDirect3DTexture9* texture, VkImage dstImage, uint32_t srcWidth, uint32_t srcHeight, uint32_t dstWidth, uint32_t dstHeight, int slot)
-        {
-            if (!g_vkUsingDxvkDevice || !texture || !dstImage || !EnsureCommandResources())
-                return false;
-
-            ID3D9VkInteropTextureHatVR* texInterop = nullptr;
-            IDirect3DDevice9* d3dDevice = nullptr;
-            ID3D9VkInteropDevicePhase5* devInterop = nullptr;
-            VkImage srcImage = VK_NULL_HANDLE;
-            VkImageLayout srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VkImageCreateInfo srcInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            if (FAILED(texture->QueryInterface(__uuidof(ID3D9VkInteropTextureHatVR), reinterpret_cast<void**>(&texInterop))) || !texInterop)
-                goto fail;
-            if (FAILED(texture->GetDevice(&d3dDevice)) || !d3dDevice)
-                goto fail;
-            if (FAILED(d3dDevice->QueryInterface(__uuidof(ID3D9VkInteropDevicePhase5), reinterpret_cast<void**>(&devInterop))) || !devInterop)
-                goto fail;
-
-            // DXVK explicitly requires this before Vulkan commands touch a D3D9 resource.
-            devInterop->FlushRenderingCommands();
-
-            if (FAILED(texInterop->GetVulkanImageInfo(&srcImage, &srcLayout, &srcInfo)) || !srcImage)
-                goto fail;
-            const bool directSbs = slot >= 0 && slot < 2 &&
-                srcInfo.extent.width == srcWidth * 2u && srcInfo.extent.height == srcHeight;
-            if (!directSbs && (srcInfo.extent.width != srcWidth || srcInfo.extent.height != srcHeight))
-            {
-                DxvkPathTrace("VKBRIDGE-V5 PHASE5 DIRECT size mismatch src=%ux%u expectedEye=%ux%u slot=%d",
-                    srcInfo.extent.width, srcInfo.extent.height, srcWidth, srcHeight, slot);
-                goto fail;
-            }
-
-            bool canNis = g_openXrUpscalingEnabled && slot >= 0 && slot < 2 && (dstWidth > srcWidth || dstHeight > srcHeight);
-
-            // No D3D9 calls are made while the DXVK submission queue is locked.
-            devInterop->LockSubmissionQueue();
-            {
-                if(canNis && g_openXrUpscaler==0 && !EnsureNisOutput(dstWidth,dstHeight,(VkFormat)g_vkSwapchainFormat)) canNis=false;
-                if(canNis && g_openXrUpscaler==1 && !EnsureFsrOutput(dstWidth,dstHeight)) canNis=false;
-                vkResetFences(g_vkDevice, 1, &g_vkFence);
-                vkResetCommandBuffer(g_vkCommandBuffer, 0);
-                VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                if (vkBeginCommandBuffer(g_vkCommandBuffer, &bi) != VK_SUCCESS) goto locked_fail;
-
-                VkImageView nisTempView = VK_NULL_HANDLE;
-                bool recordedNis = false;
-                const bool wantNis = canNis;
-                if (wantNis)
-                {
-                    const uint32_t sourceX = directSbs ? (uint32_t)slot * srcWidth : 0u;
-                    nisTempView = (g_openXrUpscaler==1) ? RecordFsrUpscale(g_vkCommandBuffer, srcImage, srcInfo.format, srcLayout,
-                        srcInfo.extent.width, srcInfo.extent.height, sourceX, 0, srcWidth, srcHeight,
-                        dstImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, dstWidth, dstHeight) : RecordNisUpscale(g_vkCommandBuffer, srcImage, srcInfo.format, srcLayout,
-                        srcInfo.extent.width, srcInfo.extent.height, sourceX, 0, srcWidth, srcHeight,
-                        dstImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, dstWidth, dstHeight);
-                    if (nisTempView) recordedNis = true;
-                    else DxvkPathTrace("SCALER-V1 same-device dispatch unavailable (upscaler=%d); falling back to linear for slot=%d", g_openXrUpscaler, slot);
-
-                }
-
-                if(!recordedNis)
-                {
-                    VkImageMemoryBarrier barriers[2]{};
-                    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                    barriers[0].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-                    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    barriers[0].oldLayout = srcLayout;
-                    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    barriers[0].image = srcImage;
-                    barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-                    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                    barriers[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    barriers[1].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    barriers[1].image = dstImage;
-                    barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-                    vkCmdPipelineBarrier(g_vkCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        0, 0, nullptr, 0, nullptr, 2, barriers);
-
-                    VkImageBlit blit{};
-                    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                    const int32_t sourceX = directSbs ? (int32_t)slot * (int32_t)srcWidth : 0;
-                    blit.srcOffsets[0] = { sourceX, 0, 0 };
-                    blit.srcOffsets[1] = { sourceX + (int32_t)srcWidth, (int32_t)srcHeight, 1 };
-                    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                    blit.dstOffsets[0] = { 0, 0, 0 };
-                    blit.dstOffsets[1] = { (int32_t)dstWidth, (int32_t)dstHeight, 1 };
-                    vkCmdBlitImage(g_vkCommandBuffer, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-
-                    VkImageMemoryBarrier restore[2] = { barriers[0], barriers[1] };
-                    restore[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    restore[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-                    restore[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    restore[0].newLayout = srcLayout;
-                    restore[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    restore[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-                    restore[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                    restore[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                    vkCmdPipelineBarrier(g_vkCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                        0, 0, nullptr, 0, nullptr, 2, restore);
-
-                }
-
-                if (vkEndCommandBuffer(g_vkCommandBuffer) != VK_SUCCESS) goto locked_fail;
-                VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                si.commandBufferCount = 1; si.pCommandBuffers = &g_vkCommandBuffer;
-                if (vkQueueSubmit(g_vkQueue, 1, &si, g_vkFence) != VK_SUCCESS) goto locked_fail;
-                if (vkWaitForFences(g_vkDevice, 1, &g_vkFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) goto locked_fail;
-                if(nisTempView) vkDestroyImageView(g_vkDevice,nisTempView,nullptr);
-                devInterop->ReleaseSubmissionQueue();
-                DxvkPathTrace("VKBRIDGE-V5 PHASE5 DIRECT-GPU copy src=%p layout=%d dst=%p %ux%u",
-                    srcImage, (int)srcLayout, dstImage, dstWidth, dstHeight);
-                devInterop->Release(); d3dDevice->Release(); texInterop->Release();
-                return true;
-            }
-
-        locked_fail:
-            devInterop->ReleaseSubmissionQueue();
-        fail:
-            if (devInterop) devInterop->Release();
-            if (d3dDevice) d3dDevice->Release();
-            if (texInterop) texInterop->Release();
             return false;
         }
 
@@ -2150,12 +2058,39 @@ namespace ahitvr
             XrEventDataBuffer event{ XR_TYPE_EVENT_DATA_BUFFER };
             while (xrPollEvent(g_vkXrInstance, &event) == XR_SUCCESS)
             {
+                if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED)
+                {
+                    // Crucial for troubleshooting a Steam Frame that is being
+                    // presented by SteamVR as Oculus Touch, or an Index that
+                    // has only one connected controller.
+                    for (const char* hand : { "/user/hand/left", "/user/hand/right" })
+                    {
+                        XrPath handPath = XR_NULL_PATH;
+                        if (XR_FAILED(xrStringToPath(g_vkXrInstance, hand, &handPath)))
+                            continue;
+                        XrInteractionProfileState state{ XR_TYPE_INTERACTION_PROFILE_STATE };
+                        if (XR_FAILED(xrGetCurrentInteractionProfile(g_vkXrSession,
+                                handPath, &state)))
+                            continue;
+                        char path[XR_MAX_PATH_LENGTH] = {};
+                        uint32_t size = 0;
+                        if (state.interactionProfile != XR_NULL_PATH &&
+                            XR_SUCCEEDED(xrPathToString(g_vkXrInstance,
+                                state.interactionProfile, sizeof(path), &size, path)))
+                            DxvkPathTrace("VKXR-INPUT PROFILE hand=%s profile=%s", hand, path);
+                        else
+                            DxvkPathTrace("VKXR-INPUT PROFILE hand=%s profile=<none>", hand);
+                    }
+                }
                 if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
                 {
                     const auto* changed =
                         reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
+                    const XrSessionState previousState = g_vkSessionState;
                     g_vkSessionState = changed->state;
-                    DxvkPathTrace("VKXR-V8 SESSION STATE=%d", (int)g_vkSessionState);
+                    DxvkPathTrace("VKXR-STATE runtime=%s state=%d previous=%d session=%p running=%d",
+                        g_vkRuntimeName, (int)changed->state, (int)previousState,
+                        g_vkXrSession, g_vkSessionRunning ? 1 : 0);
 
                     if (changed->state == XR_SESSION_STATE_READY && !g_vkSessionRunning)
                     {
@@ -2165,10 +2100,12 @@ namespace ahitvr
                         const XrResult xr = xrBeginSession(g_vkXrSession, &bi);
                         DxvkPathTrace("VKXR-V8 xrBeginSession result=%d", (int)xr);
                         if (XR_SUCCEEDED(xr)) g_vkSessionRunning = true;
+                        else LogXrFailure("xrBeginSession", xr);
                     }
                     else if (changed->state == XR_SESSION_STATE_STOPPING &&
                              g_vkSessionRunning)
                     {
+                        g_vkHaveReusableEyePair = false;
                         xrEndSession(g_vkXrSession);
                         g_vkSessionRunning = false;
                     }
@@ -2181,6 +2118,19 @@ namespace ahitvr
                 event = { XR_TYPE_EVENT_DATA_BUFFER };
             }
         }
+    }
+
+    // Public API consumed by core/config.inl (a separate translation unit).
+    // Keep this outside the anonymous implementation namespace so the
+    // declaration in vulkan_backend.h has an externally linkable definition.
+    void SetNewSequentialStereoUiPixelAspectCorrection(bool enabled)
+    {
+        g_vkPreserveUiPixelAspect = enabled;
+    }
+
+    void SetNewSequentialStereoUiCrop16x9(bool enabled)
+    {
+        g_vkCropNewSequentialStereoUi16x9 = enabled;
     }
 
     bool IsVulkanBackendActive()
@@ -2207,7 +2157,6 @@ namespace ahitvr
     {
         if (IsVulkanBackendActive()) return true;
 
-        DxvkPathTrace("VKBRIDGE-V5 PHASE8.3 DIRECT-SBS+UI-FIX BUILD-STAMP 2026-09-20G vulkan_backend.cpp ACTIVE");
         DxvkPathTrace("VKXR-V8 ActivateVulkanBackend ENTER");
         uint32_t extCount = 0;
         XrResult xr = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
@@ -2216,21 +2165,22 @@ namespace ahitvr
         std::vector<XrExtensionProperties> exts(extCount, { XR_TYPE_EXTENSION_PROPERTIES });
         xr = xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data());
         if (XR_FAILED(xr)) { LogXrFailure("xrEnumerateInstanceExtensionProperties(list)", xr); return false; }
-        const bool haveVulkan1 = HasExtension(exts, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-        const bool haveVulkan2 = HasExtension(exts, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
-        if (!haveVulkan1 || !haveVulkan2)
+        // XR_KHR_vulkan_enable2 owns the independent instance/device. HatVR
+        // never binds the borrowed DXVK VkDevice as an OpenXR graphics device.
+        if (!HasExtension(exts, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME))
         {
-            DxvkPathTrace("VKXR-V8 Vulkan extensions unavailable enable1=%d enable2=%d", haveVulkan1 ? 1 : 0, haveVulkan2 ? 1 : 0);
+            DxvkPathTrace("VKXR-INIT FAILED: runtime does not advertise XR_KHR_vulkan_enable2; no shared-device or CPU fallback");
             return false;
         }
-
-        // the borrowed DXVK device must use XR_KHR_vulkan_enable. enable2 requires
-        // the VkInstance/VkDevice to be created through OpenXR, which DXVK's are not.
-        // keep enable2 enabled only for HatVR's separate-device fallback below.
-        const char* enabledExtensions[] = {
-            XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
-            XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME
-        };
+        // Native Steam Frame controls are optional. Other runtimes must still
+        // initialize with only XR_KHR_vulkan_enable2, and Steam Frame itself
+        // can fall back to SteamVR's Oculus Touch emulation.
+        constexpr const char* kFrameExtension = "XR_VALVE_frame_controller_interaction";
+        g_hatVrFrameControllerExtensionEnabled = HasExtension(exts, kFrameExtension);
+        std::vector<const char*> enabledExtensions{ XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME };
+        if (g_hatVrFrameControllerExtensionEnabled)
+            enabledExtensions.push_back(kFrameExtension);
+        DxvkPathTrace("VKXR-INPUT Steam Frame native extension=%d", g_hatVrFrameControllerExtensionEnabled ? 1 : 0);
         XrInstanceCreateInfo ici{ XR_TYPE_INSTANCE_CREATE_INFO };
         std::strncpy(ici.applicationInfo.applicationName, "A Hat in Time (VR)", XR_MAX_APPLICATION_NAME_SIZE - 1);
         std::strncpy(ici.applicationInfo.engineName, "Unreal Engine 3 / HatVR", XR_MAX_ENGINE_NAME_SIZE - 1);
@@ -2238,8 +2188,8 @@ namespace ahitvr
         ici.applicationInfo.engineVersion = 1;
         // conservative OpenXR request.
         ici.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-        ici.enabledExtensionCount = 2;
-        ici.enabledExtensionNames = enabledExtensions;
+        ici.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
+        ici.enabledExtensionNames = enabledExtensions.data();
 
         xr = xrCreateInstance(&ici, &g_vkXrInstance);
         if (XR_FAILED(xr)) { LogXrFailure("xrCreateInstance", xr); g_vkXrInstance = XR_NULL_HANDLE; return false; }
@@ -2298,19 +2248,11 @@ namespace ahitvr
             vkViewConfig[1].recommendedImageRectHeight,
             vkViewConfig[1].recommendedSwapchainSampleCount);
 
-        PFN_xrGetVulkanGraphicsRequirementsKHR xrGetReq1 = nullptr;
-        PFN_xrGetVulkanGraphicsDeviceKHR xrGetVkDevice1 = nullptr;
-        PFN_xrGetVulkanInstanceExtensionsKHR xrGetVkInstanceExts1 = nullptr;
-        PFN_xrGetVulkanDeviceExtensionsKHR xrGetVkDeviceExts1 = nullptr;
         PFN_xrGetVulkanGraphicsRequirements2KHR xrGetReq = nullptr;
         PFN_xrCreateVulkanInstanceKHR xrCreateVkInstance = nullptr;
         PFN_xrGetVulkanGraphicsDevice2KHR xrGetVkDevice = nullptr;
         PFN_xrCreateVulkanDeviceKHR xrCreateVkLogicalDevice = nullptr;
 #define GET_XR_PROC(n, v) do { xr = xrGetInstanceProcAddr(g_vkXrInstance, n, reinterpret_cast<PFN_xrVoidFunction*>(&(v))); if (XR_FAILED(xr) || !(v)) { LogXrFailure("xrGetInstanceProcAddr(" n ")", xr); ShutdownVulkanBackend(); return false; } } while (0)
-        GET_XR_PROC("xrGetVulkanGraphicsRequirementsKHR", xrGetReq1);
-        GET_XR_PROC("xrGetVulkanGraphicsDeviceKHR", xrGetVkDevice1);
-        GET_XR_PROC("xrGetVulkanInstanceExtensionsKHR", xrGetVkInstanceExts1);
-        GET_XR_PROC("xrGetVulkanDeviceExtensionsKHR", xrGetVkDeviceExts1);
         GET_XR_PROC("xrGetVulkanGraphicsRequirements2KHR", xrGetReq);
         GET_XR_PROC("xrCreateVulkanInstanceKHR", xrCreateVkInstance);
         GET_XR_PROC("xrGetVulkanGraphicsDevice2KHR", xrGetVkDevice);
@@ -2325,108 +2267,13 @@ namespace ahitvr
             XR_VERSION_MAJOR(req.minApiVersionSupported), XR_VERSION_MINOR(req.minApiVersionSupported), XR_VERSION_PATCH(req.minApiVersionSupported),
             XR_VERSION_MAJOR(req.maxApiVersionSupported), XR_VERSION_MINOR(req.maxApiVersionSupported), XR_VERSION_PATCH(req.maxApiVersionSupported));
 
-        if (g_dxvkProbeInstance != VK_NULL_HANDLE && g_dxvkProbePhysical != VK_NULL_HANDLE)
+        DxvkPathTrace("VKXR-INIT deviceMode=SEPARATE runtime='%s' DXVK=(instance=%p physical=%p device=%p queue=%p family=%u index=%u)",
+            g_vkRuntimeName, g_dxvkProbeInstance, g_dxvkProbePhysical,
+            g_dxvkProbeDevice, g_dxvkProbeQueue, g_dxvkProbeQueueFamily, g_dxvkProbeQueueIndex);
+        if (!g_dxvkProbePhysical || !g_dxvkProbeDevice || !g_dxvkProbeQueue)
         {
-            XrVulkanGraphicsDeviceGetInfoKHR probeInfo{ XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR };
-            probeInfo.systemId = g_vkXrSystemId;
-            probeInfo.vulkanInstance = g_dxvkProbeInstance;
-            VkPhysicalDevice xrPhysicalInDxvkInstance = VK_NULL_HANDLE;
-            const XrResult probeXr = xrGetVkDevice(g_vkXrInstance, &probeInfo, &xrPhysicalInDxvkInstance);
-            DxvkPathTrace(
-                "VKBRIDGE-V5 PHASE4A XR-PHYSICAL-FOR-DXVK-INSTANCE xr=%d runtimePhysical=%p dxvkPhysical=%p MATCH=%s",
-                (int)probeXr, xrPhysicalInDxvkInstance, g_dxvkProbePhysical,
-                (XR_SUCCEEDED(probeXr) && xrPhysicalInDxvkInstance == g_dxvkProbePhysical) ? "YES" : "NO");
-
-            HMODULE probeVulkan = GetModuleHandleA("vulkan-1.dll");
-            auto probeGip = probeVulkan ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(probeVulkan, "vkGetInstanceProcAddr")) : nullptr;
-            if (probeGip)
-            {
-                auto getProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(probeGip(g_dxvkProbeInstance, "vkGetPhysicalDeviceProperties"));
-                if (getProps)
-                {
-                    VkPhysicalDeviceProperties props{};
-                    getProps(g_dxvkProbePhysical, &props);
-                    DxvkPathTrace(
-                        "VKBRIDGE-V5 PHASE4A DXVK-PHYSICAL name=%s api=%u.%u.%u driver=0x%08X vendor=0x%04X deviceId=0x%04X",
-                        props.deviceName, VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion),
-                        props.driverVersion, props.vendorID, props.deviceID);
-                }
-            }
-            DxvkPathTrace(
-                "VKBRIDGE-V5 PHASE4A DXVK-QUEUE device=%p queue=%p family=%u index=%u (probe only; no HatVR submissions)",
-                g_dxvkProbeDevice, g_dxvkProbeQueue, g_dxvkProbeQueueFamily, g_dxvkProbeQueueIndex);
-        }
-        else
-        {
-            DxvkPathTrace("VKBRIDGE-V5 PHASE4A no DXVK Vulkan context was supplied before OpenXR activation");
-        }
-
-        // Borrowed DXVK Vulkan objects must use the original Vulkan binding.
-        // VirtualDesktopXR requires Vulkan instance extensions that DXVK's existing
-        // instance was not created with. Use HatVR's OpenXR-owned Vulkan device so
-        // the existing external-memory bridge can move the rendered eyes across.
-        const bool forceSeparateXrDevice = _stricmp(g_vkRuntimeName, "VirtualDesktopXR") == 0;
-        if (forceSeparateXrDevice)
-            DxvkPathTrace("VKBRIDGE-V5 PHASE5 runtime=%s forcing OpenXR-owned Vulkan device + GPU bridge", g_vkRuntimeName);
-
-        // enable2 is only valid when OpenXR created the instance and device.
-        if (!forceSeparateXrDevice && g_dxvkProbeInstance && g_dxvkProbePhysical && g_dxvkProbeDevice && g_dxvkProbeQueue)
-        {
-            XrGraphicsRequirementsVulkanKHR req1{ XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR };
-            const XrResult req1Xr = xrGetReq1(g_vkXrInstance, g_vkXrSystemId, &req1);
-
-            uint32_t instanceExtBytes = 0, deviceExtBytes = 0;
-            XrResult instanceExtXr = xrGetVkInstanceExts1(g_vkXrInstance, g_vkXrSystemId, 0, &instanceExtBytes, nullptr);
-            XrResult deviceExtXr = xrGetVkDeviceExts1(g_vkXrInstance, g_vkXrSystemId, 0, &deviceExtBytes, nullptr);
-            std::vector<char> instanceExts(instanceExtBytes ? instanceExtBytes : 1, 0);
-            std::vector<char> deviceExts(deviceExtBytes ? deviceExtBytes : 1, 0);
-            if (XR_SUCCEEDED(instanceExtXr) && instanceExtBytes)
-                instanceExtXr = xrGetVkInstanceExts1(g_vkXrInstance, g_vkXrSystemId, instanceExtBytes, &instanceExtBytes, instanceExts.data());
-            if (XR_SUCCEEDED(deviceExtXr) && deviceExtBytes)
-                deviceExtXr = xrGetVkDeviceExts1(g_vkXrInstance, g_vkXrSystemId, deviceExtBytes, &deviceExtBytes, deviceExts.data());
-
-            VkPhysicalDevice runtimePhysical = VK_NULL_HANDLE;
-            const XrResult physicalXr = xrGetVkDevice1(g_vkXrInstance, g_vkXrSystemId, g_dxvkProbeInstance, &runtimePhysical);
-            DxvkPathTrace(
-                "VKBRIDGE-V5 PHASE5 ENABLE1 req=%d physicalXr=%d runtimePhysical=%p dxvkPhysical=%p MATCH=%s",
-                (int)req1Xr, (int)physicalXr, runtimePhysical, g_dxvkProbePhysical,
-                (XR_SUCCEEDED(physicalXr) && runtimePhysical == g_dxvkProbePhysical) ? "YES" : "NO");
-            DxvkPathTrace("VKBRIDGE-V5 PHASE5 ENABLE1 required-instance-exts='%s'",
-                XR_SUCCEEDED(instanceExtXr) ? instanceExts.data() : "<query failed>");
-            DxvkPathTrace("VKBRIDGE-V5 PHASE5 ENABLE1 required-device-exts='%s'",
-                XR_SUCCEEDED(deviceExtXr) ? deviceExts.data() : "<query failed>");
-
-            if (XR_SUCCEEDED(req1Xr) && XR_SUCCEEDED(physicalXr) && runtimePhysical == g_dxvkProbePhysical &&
-                XR_SUCCEEDED(instanceExtXr) && XR_SUCCEEDED(deviceExtXr))
-            {
-                XrGraphicsBindingVulkanKHR dxvkBinding{ XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR };
-                dxvkBinding.instance = g_dxvkProbeInstance;
-                dxvkBinding.physicalDevice = g_dxvkProbePhysical;
-                dxvkBinding.device = g_dxvkProbeDevice;
-                dxvkBinding.queueFamilyIndex = g_dxvkProbeQueueFamily;
-                dxvkBinding.queueIndex = g_dxvkProbeQueueIndex;
-                XrSessionCreateInfo dxvkSci{ XR_TYPE_SESSION_CREATE_INFO };
-                dxvkSci.next = &dxvkBinding;
-                dxvkSci.systemId = g_vkXrSystemId;
-                XrSession dxvkSession = XR_NULL_HANDLE;
-                const XrResult directXr = xrCreateSession(g_vkXrInstance, &dxvkSci, &dxvkSession);
-                DxvkPathTrace("VKBRIDGE-V5 PHASE5 DIRECT-XR-SESSION enable1 xr=%d session=%p",
-                    (int)directXr, dxvkSession);
-                if (XR_SUCCEEDED(directXr) && dxvkSession != XR_NULL_HANDLE)
-                {
-                    g_vkXrSession = dxvkSession;
-                    g_vkInstance = g_dxvkProbeInstance;
-                    g_vkPhysicalDevice = g_dxvkProbePhysical;
-                    g_vkDevice = g_dxvkProbeDevice;
-                    g_vkQueue = g_dxvkProbeQueue;
-                    g_vkQueueFamily = g_dxvkProbeQueueFamily;
-                    g_vkQueueIndex = g_dxvkProbeQueueIndex;
-                    g_vkOwnsInstance = false;
-                    g_vkOwnsDevice = false;
-                    g_vkUsingDxvkDevice = true;
-                    DxvkPathTrace("VKBRIDGE-V5 PHASE5 DIRECT-XR-SESSION SUCCESS - legal enable1 binding shares DXVK VkDevice");
-                }
-            }
+            DxvkPathTrace("VKXR-INIT FAILED: DXVK GPU bridge producer unavailable; no CPU fallback");
+            ShutdownVulkanBackend(); return false;
         }
 
         HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
@@ -2441,7 +2288,6 @@ namespace ahitvr
             XR_VERSION_MINOR(req.minApiVersionSupported), 0);
         if (reqApi > vkApi) vkApi = reqApi;
 
-        if (g_vkXrSession == XR_NULL_HANDLE)
         {
         VkApplicationInfo vai{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
         vai.pApplicationName = "A Hat in Time (VR)";
@@ -2462,7 +2308,10 @@ namespace ahitvr
             DxvkPathTrace("VKXR-V8 xrCreateVulkanInstanceKHR FAILED xr=%d vk=%d", (int)xr, (int)vr);
             ShutdownVulkanBackend(); return false;
         }
+        g_vkOwnsInstance = true; // important even if any later init step fails
         g_vkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(gip(g_vkInstance, "vkDestroyInstance"));
+        DxvkPathTrace("VKXR-INIT separate Vulkan instance READY instance=%p vkApi=%u.%u.%u",
+            g_vkInstance, VK_VERSION_MAJOR(vkApi), VK_VERSION_MINOR(vkApi), VK_VERSION_PATCH(vkApi));
 
         XrVulkanGraphicsDeviceGetInfoKHR gdgi{ XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR };
         gdgi.systemId = g_vkXrSystemId;
@@ -2478,25 +2327,58 @@ namespace ahitvr
         qci.queueFamilyIndex = g_vkQueueFamily;
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
-        const char* phase6DeviceExtensions[] = {
-            VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-            VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
-            VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME
+        // Required for GPU-only cross-device image/semaphore transfer. The
+        // shaderFloat16Int8 is optional for GPU copying. If an upscaler
+        // cannot initialize on this device, the existing copy path uses
+        // a linear GPU blit instead of preventing OpenXR initialization.
+        uint32_t deviceExtCount = 0;
+        VkResult extVr = vkEnumerateDeviceExtensionProperties(g_vkPhysicalDevice,
+            nullptr, &deviceExtCount, nullptr);
+        if (extVr != VK_SUCCESS) {
+            DxvkPathTrace("VKXR-INIT FAILED: vkEnumerateDeviceExtensionProperties count vk=%d", (int)extVr);
+            ShutdownVulkanBackend(); return false;
+        }
+        std::vector<VkExtensionProperties> availableDeviceExts(deviceExtCount);
+        extVr = vkEnumerateDeviceExtensionProperties(g_vkPhysicalDevice,
+            nullptr, &deviceExtCount, availableDeviceExts.data());
+        if (extVr != VK_SUCCESS) {
+            DxvkPathTrace("VKXR-INIT FAILED: vkEnumerateDeviceExtensionProperties list vk=%d", (int)extVr);
+            ShutdownVulkanBackend(); return false;
+        }
+        auto supportsDeviceExt = [&](const char* extName) {
+            return std::any_of(availableDeviceExts.begin(), availableDeviceExts.end(),
+                [extName](const VkExtensionProperties& e) {
+                    return std::strcmp(e.extensionName, extName) == 0;
+                });
         };
+        if (!supportsDeviceExt(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME) ||
+            !supportsDeviceExt(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME))
+        {
+            DxvkPathTrace("VKXR-INIT FAILED: external-memory-win32=%d external-semaphore-win32=%d (no CPU fallback)",
+                supportsDeviceExt(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME) ? 1 : 0,
+                supportsDeviceExt(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME) ? 1 : 0);
+            ShutdownVulkanBackend(); return false;
+        }
+        const bool fp16Extension = supportsDeviceExt(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+        std::vector<const char*> phase6DeviceExtensions{
+            VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+            VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME
+        };
+        if (fp16Extension) phase6DeviceExtensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
         VkPhysicalDeviceShaderFloat16Int8Features nisFp16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         VkPhysicalDeviceFeatures2 featureQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; featureQuery.pNext=&nisFp16;
         vkGetPhysicalDeviceFeatures2(g_vkPhysicalDevice,&featureQuery);
         VkPhysicalDeviceFeatures nisBaseEnable{};
         nisBaseEnable.shaderStorageImageWriteWithoutFormat = featureQuery.features.shaderStorageImageWriteWithoutFormat;
         VkPhysicalDeviceShaderFloat16Int8Features nisEnable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
-        nisEnable.shaderFloat16=nisFp16.shaderFloat16;
+        nisEnable.shaderFloat16=fp16Extension ? nisFp16.shaderFloat16 : VK_FALSE;
         VkDeviceCreateInfo vdci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         vdci.pNext = nisEnable.shaderFloat16 ? &nisEnable : nullptr;
         vdci.pEnabledFeatures = &nisBaseEnable;
         vdci.queueCreateInfoCount = 1;
         vdci.pQueueCreateInfos = &qci;
-        vdci.enabledExtensionCount = 3;
-        vdci.ppEnabledExtensionNames = phase6DeviceExtensions;
+        vdci.enabledExtensionCount = static_cast<uint32_t>(phase6DeviceExtensions.size());
+        vdci.ppEnabledExtensionNames = phase6DeviceExtensions.data();
         DxvkPathTrace("VKBRIDGE-V5 requesting XR-device extensions + NIS fp16=%d",nisEnable.shaderFloat16?1:0);
 
         XrVulkanDeviceCreateInfoKHR xvdci{ XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR };
@@ -2511,10 +2393,34 @@ namespace ahitvr
             DxvkPathTrace("VKXR-V8 xrCreateVulkanDeviceKHR FAILED xr=%d vk=%d", (int)xr, (int)vr);
             ShutdownVulkanBackend(); return false;
         }
+        g_vkOwnsDevice = true; // clean up even if xrCreateSession subsequently fails
         auto gdp = reinterpret_cast<PFN_vkGetDeviceProcAddr>(gip(g_vkInstance, "vkGetDeviceProcAddr"));
-        g_vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(gdp(g_vkDevice, "vkDestroyDevice"));
+        g_vkDestroyDevice = gdp ? reinterpret_cast<PFN_vkDestroyDevice>(gdp(g_vkDevice, "vkDestroyDevice")) : nullptr;
+        if (!g_vkDestroyDevice) {
+            DxvkPathTrace("VKXR-INIT FAILED: vkDestroyDevice entry point unavailable");
+            ShutdownVulkanBackend(); return false;
+        }
+        if (!ValidateBridgeAdapterIdentity() ||
+            !SupportsBridgeImage(g_dxvkProbePhysical, VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT, "DXVK-export") ||
+            !SupportsBridgeImage(g_vkPhysicalDevice, VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT, "XR-import") ||
+            !SupportsBridgeSemaphore(g_dxvkProbePhysical, VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT, "DXVK-export") ||
+            !SupportsBridgeSemaphore(g_vkPhysicalDevice, VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT, "XR-import"))
+        {
+            DxvkPathTrace("VKXR-INIT FAILED: GPU-only cross-device bridge unsupported on selected Vulkan devices");
+            ShutdownVulkanBackend(); return false;
+        }
+        DxvkPathTrace("VKXR-INIT separate Vulkan device READY device=%p physical=%p family=%u fp16=%d",
+            g_vkDevice, g_vkPhysicalDevice, g_vkQueueFamily, nisEnable.shaderFloat16 ? 1 : 0);
         auto gdq = reinterpret_cast<PFN_vkGetDeviceQueue>(gdp(g_vkDevice, "vkGetDeviceQueue"));
+        if (!gdq) {
+            DxvkPathTrace("VKXR-INIT FAILED: vkGetDeviceQueue entry point unavailable");
+            ShutdownVulkanBackend(); return false;
+        }
         gdq(g_vkDevice, g_vkQueueFamily, 0, &g_vkQueue);
+        if (!g_vkQueue) {
+            DxvkPathTrace("VKXR-INIT FAILED: Vulkan graphics queue unavailable");
+            ShutdownVulkanBackend(); return false;
+        }
         VulkanTraceMarkHatVRDevice(g_vkDevice, g_vkQueue, g_vkQueueFamily);
 
         XrGraphicsBindingVulkan2KHR binding{ XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR };
@@ -2528,17 +2434,9 @@ namespace ahitvr
         sci.systemId = g_vkXrSystemId;
         xr = xrCreateSession(g_vkXrInstance, &sci, &g_vkXrSession);
         if (XR_FAILED(xr)) { LogXrFailure("xrCreateSession(Vulkan)", xr); ShutdownVulkanBackend(); return false; }
-        g_vkOwnsInstance = true;
-        g_vkOwnsDevice = true;
-        g_vkUsingDxvkDevice = false;
+        DxvkPathTrace("VKXR-INIT xrCreateSession(Vulkan2) SUCCESS session=%p device=%p (separate logical device)",
+            g_vkXrSession, g_vkDevice);
         }
-        else
-        {
-            // Resolve loader entry points for the borrowed DXVK device; never destroy it.
-            g_vkDestroyInstance = nullptr;
-            g_vkDestroyDevice = nullptr;
-        }
-
         XrReferenceSpaceCreateInfo rs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
         rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
         rs.poseInReferenceSpace.orientation.w = 1.0f;
@@ -2557,8 +2455,8 @@ namespace ahitvr
         }
 
         NoteGraphicsApiInitialized(GraphicsApi::Vulkan);
-        DxvkPathTrace("VKXR-V8 BOOTSTRAP SUCCESS session=%p device=%p queueFamily=%u",
-            g_vkXrSession, g_vkDevice, g_vkQueueFamily);
+        DxvkPathTrace("VKXR-INIT COMPLETE mode=SEPARATE runtime=%s session=%p device=%p queueFamily=%u",
+            g_vkRuntimeName, g_vkXrSession, g_vkDevice, g_vkQueueFamily);
         return true;
     }
 
@@ -2594,7 +2492,13 @@ namespace ahitvr
 
         PollEvents();
         if (!g_vkSessionRunning || g_vkExitRequested)
+        {
+            if (g_vkBeginSerial <= 8 || (g_vkBeginSerial % 300ULL) == 0)
+                DxvkPathTrace("VKXR-FRAME WAITING #%llu runtime=%s state=%d running=%d exit=%d session=%p",
+                    g_vkBeginSerial, g_vkRuntimeName, (int)g_vkSessionState,
+                    g_vkSessionRunning ? 1 : 0, g_vkExitRequested ? 1 : 0, g_vkXrSession);
             return false;
+        }
 
         XrFrameWaitInfo wi{ XR_TYPE_FRAME_WAIT_INFO };
         XrFrameState fs{ XR_TYPE_FRAME_STATE };
@@ -2623,12 +2527,19 @@ namespace ahitvr
             (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
             (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
 
-        if (g_vkBeginSerial <= 12 || (g_vkBeginSerial % 300ULL) == 0)
+        if (g_debugToolsEnabled && (g_vkBeginSerial <= 12 || (g_vkBeginSerial % 300ULL) == 0))
             DxvkPathTrace("VKXR-V8 FRAME BEGIN #%llu shouldRender=%d locate=%d count=%u flags=0x%llX",
                 g_vkBeginSerial, g_vkFrameShouldRender ? 1 : 0, (int)xr, count,
                 (unsigned long long)vs.viewStateFlags);
 
-        if (!valid) return true;
+        if (!valid)
+        {
+            if (g_vkBeginSerial <= 12 || (g_vkBeginSerial % 300ULL) == 0)
+                DxvkPathTrace("VKXR-FRAME VIEW INVALID #%llu xr=%d count=%u flags=0x%llX shouldRender=%d",
+                    g_vkBeginSerial, (int)xr, count,
+                    (unsigned long long)vs.viewStateFlags, g_vkFrameShouldRender ? 1 : 0);
+            return true;
+        }
         if (outViews) { outViews[0] = g_vkViews[0]; outViews[1] = g_vkViews[1]; }
         if (outPredictedDisplayTime) *outPredictedDisplayTime = g_vkPredictedDisplayTime;
         if (outShouldRender) *outShouldRender = g_vkFrameShouldRender;
@@ -2702,6 +2613,7 @@ namespace ahitvr
         UINT width,
         UINT height,
         const XrView submitViews[2],
+        bool reusePreviousEyes,
         IDirect3DTexture9* finishedUiTexture,
         bool theaterMode,
         bool menuOpen,
@@ -2804,15 +2716,16 @@ namespace ahitvr
         if (g_vkFrameShouldRender && EnsureEyeSwapchains(xrWidth, xrHeight))
         {
             IDirect3DTexture9* src[2] = { leftEye, rightEye };
-            bool complete = true;
+            bool complete = !reusePreviousEyes || g_vkHaveReusableEyePair;
 
-            g_vkBridgeTiming[0] = {};
-            g_vkBridgeTiming[1] = {};
             LARGE_INTEGER bridgeBegin{}, bridgeEnd{};
             QueryPerformanceCounter(&bridgeBegin);
 
-            const XrView* views = submitViews ? submitViews : g_vkViews;
-            for (int eye = 0; eye < 2 && complete; ++eye)
+            const XrView* views = (reusePreviousEyes && g_vkHaveReusableEyePair)
+                ? g_vkLastEyePairViews : (submitViews ? submitViews : g_vkViews);
+            const bool eyePairTheaterMode = (reusePreviousEyes && g_vkHaveReusableEyePair)
+                ? g_vkLastEyePairTheaterMode : theaterMode;
+            for (int eye = 0; eye < 2 && complete && !reusePreviousEyes; ++eye)
             {
                 uint32_t idx = 0;
                 XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -2825,23 +2738,17 @@ namespace ahitvr
                 bool eyeOk = XR_SUCCEEDED(xr);
                 if (!eyeOk) LogXrFailure("xrWaitSwapchainImage", xr);
 
-                if (eyeOk && g_vkUsingDxvkDevice)
-                    eyeOk = CopyDxvkTextureToOpenXrImage(
-                        src[eye], g_vkSwapchainImages[eye][idx].image, width, height, xrWidth, xrHeight, eye);
-                else if (eyeOk)
-                    // OpenXR-frustum crop. Passing no projection FOV selects the
-                    // existing direct-copy path below, which copies the literal
-                    // SBS half:
-                    //   LEFT  = [0, eyeWidth)
-                    //   RIGHT = [eyeWidth, 2*eyeWidth)
+                if (eyeOk)
+                    // Always import the DXVK-produced GPU allocation into HatVR's
+                    // independent OpenXR Vulkan device. Never map pixels on the CPU.
                     eyeOk = Phase6CopyDxvkTextureToOpenXrImage(
-                        src[eye],
-                        g_vkSwapchainImages[eye][idx].image,
-                        width, height,
-                        xrWidth, xrHeight,
-                        eye,
+                        src[eye], g_vkSwapchainImages[eye][idx].image,
+                        width, height, xrWidth, xrHeight, eye,
                         theaterMode ? nullptr : &views[eye].fov,
                         nativeStereo && g_sharperNativeStereo && !theaterMode);
+                if (!eyeOk && (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL) == 0))
+                    DxvkPathTrace("VKBRIDGE-TRANSFER UNAVAILABLE frame=%llu eye=%d source=%ux%u dest=%ux%u",
+                        g_vkSubmitSerial, eye, width, height, xrWidth, xrHeight);
 
                 XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
                 const XrResult rr = xrReleaseSwapchainImage(g_vkEyeSwapchains[eye], &ri);
@@ -2850,22 +2757,25 @@ namespace ahitvr
                 if (!eyeOk) complete = false;
             }
 
+            // A failed left/right transfer may already have released a NEW
+            // image for one eye. The old compositor pair is then no longer
+            // guaranteed to be intact; never reuse it as if both were old.
+            if (!complete && !reusePreviousEyes)
+                g_vkHaveReusableEyePair = false;
+
             QueryPerformanceCounter(&bridgeEnd);
             if (g_vkSubmitSerial <= 120 || (g_vkSubmitSerial % 300ULL) == 0)
             {
-                const auto& l = g_vkBridgeTiming[0];
-                const auto& r = g_vkBridgeTiming[1];
-                DxvkPathTrace(
-                    "VKXR-TIMING #%llu L[rtd=%.3f copy=%.3f upcopy=%.3f gpu=%.3f] "
-                    "R[rtd=%.3f copy=%.3f upcopy=%.3f gpu=%.3f] total=%.3f ms complete=%d",
-                    g_vkSubmitSerial,
-                    l.getRenderTargetDataMs, l.lockCopyMs, l.uploadMemcpyMs, l.uploadGpuMs,
-                    r.getRenderTargetDataMs, r.lockCopyMs, r.uploadMemcpyMs, r.uploadGpuMs,
-                    QpcElapsedMs(bridgeBegin, bridgeEnd), complete ? 1 : 0);
+                DxvkPathTrace("VKXR-TIMING #%llu mode=SEPARATE bridge=GPU total=%.3f ms complete=%d",
+                    g_vkSubmitSerial, QpcElapsedMs(bridgeBegin, bridgeEnd), complete ? 1 : 0);
             }
 
             if (complete)
             {
+                if (reusePreviousEyes &&
+                    (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL) == 0))
+                    DxvkPathTrace("VKXR-NEW_SEQUENTIAL_STEREO reuse last released eyes and original poses #%llu",
+                        g_vkSubmitSerial);
                 for (int eye = 0; eye < 2; ++eye)
                 {
                     pv[eye].pose = views[eye].pose;
@@ -2880,7 +2790,7 @@ namespace ahitvr
                     };
                     pv[eye].subImage.imageArrayIndex = 0;
                 }
-                if (theaterMode)
+                if (eyePairTheaterMode)
                 {
                     // Each OpenXR eye sees the corresponding rendered eye on the
                     // same fixed physical screen, preserving cinematic stereo depth
@@ -2962,12 +2872,9 @@ namespace ahitvr
                     if (uiOk && uiStaging &&
                         ScaleFinishedUiToEyeTexture(finishedUiTexture, uiStaging, nativeStereo))
                     {
-                        if (g_vkUsingDxvkDevice)
-                            haveFreshUi = CopyDxvkTextureToOpenXrImage(
-                                uiStaging, g_vkUiSwapchainImages[uiIndex].image, xrWidth, xrHeight, xrWidth, xrHeight, 2);
-                        else
-                            haveFreshUi = Phase6CopyDxvkTextureToOpenXrImage(
-                                uiStaging, g_vkUiSwapchainImages[uiIndex].image, xrWidth, xrHeight, xrWidth, xrHeight, 2, nullptr);
+                        haveFreshUi = Phase6CopyDxvkTextureToOpenXrImage(
+                            uiStaging, g_vkUiSwapchainImages[uiIndex].image,
+                            xrWidth, xrHeight, xrWidth, xrHeight, 2, nullptr);
                     }
                     if (uiOk && !haveFreshUi)
                         uiOk = ClearOpenXrUiImageTransparent(
@@ -2999,7 +2906,14 @@ namespace ahitvr
                         uiQuad.subImage.imageArrayIndex = 0;
                         uiQuad.pose.orientation = {0,0,0,1};
                         uiQuad.pose.position = {0,hudHeight,-hudDistance};
-                        uiQuad.size.width = 1.60f * hudScale;
+                        // V6: avoid stretching eye-sized NewSequentialStereo UI horizontally
+                        // across a 16:9 panel. Preserve the original UI source
+                        // pixel aspect. This is separate from world-eye projection.
+                        const float uiAspect = (g_vkPreserveUiPixelAspect &&
+                            !nativeStereo && g_vkLastUiSourceAspect > 0.1f &&
+                            g_vkLastUiSourceAspect < 5.0f)
+                            ? g_vkLastUiSourceAspect : (16.0f / 9.0f);
+                        uiQuad.size.width = 0.90f * uiAspect * hudScale;
                         uiQuad.size.height = 0.90f * hudScale;
                         // UI/menu remains a separate compositor layer in either
                         // immersive or Theater Mode.
@@ -3015,13 +2929,19 @@ namespace ahitvr
                 // new users know how to open it without leaving a permanent HUD.
                 static ULONGLONG startupHintBeginMs=0;
                 if(!startupHintBeginMs) startupHintBeginMs=GetTickCount64();
-                const bool showStartupHint=!menuOpen && (GetTickCount64()-startupHintBeginMs)<5000ULL;
-                if((menuOpen || showStartupHint) && layerCount<4)
+                const HatVrEyeWheelDebugSample eyeWheelDebug=g_psvr2EyeWheelDebugVisuals
+                    ? HatVrReadEyeWheelDebug() : HatVrEyeWheelDebugSample{};
+                const bool showEyeWheelDebug=g_psvr2EyeWheelDebugVisuals &&
+                    g_psvr2EyeWheelEnabled && !menuOpen && eyeWheelDebug.wheelOpen &&
+                    (GetTickCount64()-eyeWheelDebug.updatedMs)<250ULL;
+                const bool showStartupHint=!menuOpen && !showEyeWheelDebug &&
+                    (GetTickCount64()-startupHintBeginMs)<5000ULL;
+                if((menuOpen || showStartupHint || showEyeWheelDebug) && layerCount<4)
                 {
                     const bool menuResourcesOk=EnsureMenuResources(leftEye,900,760);
                     if(menuResourcesOk && EnsureMenuGpuRenderer())
                     {
-                        static bool menuImageReady=false;
+                        bool menuImageReady=false; // do not reuse a stale calibration frame
                         if(true)
                         {
                             if(menuOpen)
@@ -3031,6 +2951,8 @@ namespace ahitvr
                                     hudHeadLocked,spectatorView,spectatorUiMode,menuPage,menuSelection,menuInsideCategory,
                                     uiDebugCandidateIndex,uiDebugCandidateCount,uiDebugCandidateHash,uiDebugCandidateHits,
                                     uiDebugPreviewMode,uiDebugPermanentRoute);
+                            else if(showEyeWheelDebug)
+                                BuildHatVrEyeWheelDebugOverlay(eyeWheelDebug);
                             else
                                 BuildHatVrStartupHint();
                             uint32_t idx=0;
@@ -3063,7 +2985,16 @@ namespace ahitvr
                             menuQuad.subImage.imageRect.extent={900,760};
                             menuQuad.subImage.imageArrayIndex=0;
                             menuQuad.pose.orientation={0,0,0,1};
-                            if(showStartupHint)
+                            if(showEyeWheelDebug)
+                            {
+                                // Align pixel mapping and physical transform with
+                                // the AHiT UI quad. Only a 1cm depth offset keeps
+                                // the debug rings legible without moving the HUD.
+                                menuQuad.pose.position={0,hudHeight,-(std::max)(0.15f,hudDistance-0.01f)};
+                                menuQuad.size.width=1.60f*hudScale;
+                                menuQuad.size.height=0.90f*hudScale;
+                            }
+                            else if(showStartupHint)
                             {
                                 menuQuad.pose.position={0,0,-0.50f};
                                 menuQuad.size.width=1.02f; menuQuad.size.height=0.86f;
@@ -3086,12 +3017,33 @@ namespace ahitvr
         ei.layerCount = submitted ? layerCount : 0u;
         ei.layers = submitted ? layers : nullptr;
         const XrResult endResult = xrEndFrame(g_vkXrSession, &ei);
+        if (submitted && XR_SUCCEEDED(endResult) && !reusePreviousEyes)
+        {
+            // Only a successfully submitted NEW stereo pair may replace the
+            // compositor-retained reference pose. Reused frames keep old poses.
+            // Cache the exact immutable poses/FOVs already placed into the
+            // successful projection views, not a potentially mutable pointer.
+            for (int eye = 0; eye < 2; ++eye)
+            {
+                g_vkLastEyePairViews[eye].pose = pv[eye].pose;
+                g_vkLastEyePairViews[eye].fov = pv[eye].fov;
+            }
+            g_vkLastEyePairTheaterMode = theaterMode;
+            g_vkHaveReusableEyePair = true;
+        }
 
-        if (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL) == 0 || XR_FAILED(endResult))
+        if ((g_debugToolsEnabled && (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL) == 0)) || XR_FAILED(endResult))
             DxvkPathTrace("VKXR-V8 FRAME END #%llu submitted=%d xr=%d captured=%ux%u xr=%ux%u layers=%u",
                 g_vkSubmitSerial, submitted ? 1 : 0, (int)endResult,
                 width, height, xrWidth, xrHeight, ei.layerCount);
 
+        if (submitted && XR_SUCCEEDED(endResult) && !g_vkFirstFrameSubmitted)
+        {
+            g_vkFirstFrameSubmitted = true;
+            DxvkPathTrace("VKXR-FIRST-FRAME SUCCESS runtime=%s mode=SEPARATE frame=%llu layers=%u bridge=GPU-ONLY",
+                g_vkRuntimeName, g_vkSubmitSerial, ei.layerCount);
+        }
+        else if (XR_FAILED(endResult)) LogXrFailure("xrEndFrame", endResult);
         g_vkFrameBegun = false;
         return submitted && XR_SUCCEEDED(endResult);
     }
@@ -3172,7 +3124,6 @@ namespace ahitvr
         if (g_phase6DxvkFence && g_dxvkProbeDevice) vkDestroyFence(g_dxvkProbeDevice, g_phase6DxvkFence, nullptr);
         if (g_phase6DxvkCommandPool && g_dxvkProbeDevice) vkDestroyCommandPool(g_dxvkProbeDevice, g_phase6DxvkCommandPool, nullptr);
         g_phase6DxvkFence = VK_NULL_HANDLE; g_phase6DxvkCommandPool = VK_NULL_HANDLE; g_phase6DxvkCommandBuffer = VK_NULL_HANDLE;
-        DestroyTransferCaches();
 
         if(g_vkDevice)
         {
@@ -3210,7 +3161,7 @@ namespace ahitvr
         if (g_vkOwnsInstance && g_vkInstance != VK_NULL_HANDLE && g_vkDestroyInstance) g_vkDestroyInstance(g_vkInstance, nullptr);
         g_vkDevice = VK_NULL_HANDLE; g_vkInstance = VK_NULL_HANDLE;
         g_vkPhysicalDevice = VK_NULL_HANDLE; g_vkQueue = VK_NULL_HANDLE;
-        g_vkOwnsDevice = false; g_vkOwnsInstance = false; g_vkUsingDxvkDevice = false;
+        g_vkOwnsDevice = false; g_vkOwnsInstance = false;
         if (g_vkXrInstance != XR_NULL_HANDLE) { xrDestroyInstance(g_vkXrInstance); g_vkXrInstance = XR_NULL_HANDLE; }
 
         g_vkXrSystemId = XR_NULL_SYSTEM_ID;
@@ -3225,5 +3176,9 @@ namespace ahitvr
         g_vkMaxEyeHeight = 0;
         g_vkLastSourceEyeWidth = g_vkLastSourceEyeHeight = 0;
         g_vkActiveUpscalePercent = -1;
+        g_vkFirstFrameSubmitted = false;
+        g_phase6Unavailable = false;
+        g_phase6LoggedActive = false;
+        g_vkDestroyDevice = nullptr; g_vkDestroyInstance = nullptr;
     }
 }

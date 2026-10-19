@@ -112,6 +112,7 @@ void VulkanTraceEndD3D9Resource(const char* label, long result, const void* d3dR
     struct RenderPoseHistorySlot
     {
         unsigned long long serial = 0;
+        ULONGLONG capturedAtMs = 0;
         XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
     };
     static RenderPoseHistorySlot g_renderPoseHistory[64] = {};
@@ -283,6 +284,7 @@ void VulkanTraceEndD3D9Resource(const char* label, long result, const void* d3dR
         RenderPoseHistorySlot& v79Slot = g_renderPoseHistory[g_renderPoseSnapshotSerial & 63ULL];
         v79Slot.views[0] = g_renderPoseSnapshotViews[0];
         v79Slot.views[1] = g_renderPoseSnapshotViews[1];
+        v79Slot.capturedAtMs = GetTickCount64();
         v79Slot.serial = g_renderPoseSnapshotSerial;
 
         // keep logging intentionally sparse: first few frames, then once per 120.

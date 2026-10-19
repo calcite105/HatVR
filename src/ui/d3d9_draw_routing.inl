@@ -150,6 +150,155 @@
             g_uiCandidates[candidateIndex].hash == 0x08FBD6C0B1404765ULL;
     }
 
+    // Experimental Recommended-renderer equivalent of r236's proven Family B
+    // framebuffer handling. The legacy path draws into the two SBS halves;
+    // NewSequentialStereo instead finishes both *independent* eye render targets before
+    // late shared Canvas. Replaying only the known Family B draw directly onto
+    // those saved opaque eye colors avoids detached-UI alpha and prevents late
+    // icon draws from being lost after HookSceneExecute's scene captures.
+    //
+    // Opt-out is intentional: this is a test of the historical fix, not yet a
+    // validated default for the public build.
+    template <typename DrawFn>
+    static HRESULT NewSequentialStereoReplayLateFamilyB(
+        IDirect3DDevice9* device, int candidateIndex, DrawFn&& drawOriginal)
+    {
+        // Always run the ordinary game draw first so fallback behavior stays
+        // identical (and non-NewSequentialStereo renderers are wholly untouched).
+        if (!device || !g_newSequentialStereoEnabled || !g_v138SameTickAfrActive ||
+            !IsUiCandidateFamilyB(candidateIndex) ||
+            !g_newSequentialStereoLatePromptReplay)
+            return drawOriginal();
+
+        if (CanvasTraceIsActive() && g_canvasTraceDrawLogCount < 750)
+        {
+            D3DVIEWPORT9 vp{};
+            device->GetViewport(&vp);
+            LogCategory("UI", "CANVAS_TRACE_FAMILY_B frame=%llu candidate=%d "
+                "inFlush=%d batch=%p viewport=%u,%u %ux%u "
+                "left=%p right=%p",
+                g_presentFrameNumber, candidateIndex,
+                InterlockedCompareExchange(&g_insideRedirectedUiFlush, 0, 0) ? 1 : 0,
+                g_canvasTraceActiveBatch,
+                vp.X, vp.Y, vp.Width, vp.Height,
+                g_leftEyeCopy, g_rightEyeCopy);
+            ++g_canvasTraceDrawLogCount;
+        }
+        HRESULT originalHr = drawOriginal();
+        if (FAILED(originalHr) || !g_leftEyeCopy || !g_rightEyeCopy ||
+            g_stereoCopyWidth == 0 || g_stereoCopyHeight == 0)
+            return originalHr;
+
+        // Only modify an eye pair completed by the SAME game renderer pose.
+        // Never draw onto an unmatched or stale eye retained for reprojection.
+        NewSequentialStereoEyeCaptureSnapshot left{}, right{};
+        const bool samePair = ReadNewSequentialStereoEyeCapture(0, left) &&
+            ReadNewSequentialStereoEyeCapture(1, right) && left.poseSerial != 0 &&
+            left.poseSerial == right.poseSerial &&
+            left.presentAtProduce == right.presentAtProduce &&
+            (unsigned long long)g_presentFrameNumber >= left.presentAtProduce &&
+            (unsigned long long)g_presentFrameNumber - left.presentAtProduce <= 2ULL;
+        if (!samePair)
+        {
+            static unsigned int earlyMisses = 0;
+            ++earlyMisses;
+            if (g_debugToolsEnabled && (earlyMisses <= 20 || (earlyMisses % 600u) == 0))
+                LogCategory("UI", "NEW_SEQUENTIAL_STEREO_FAMILY_B_WAIT n=%u frame=%llu L=%llu(%llu) R=%llu(%llu)",
+                    earlyMisses, (unsigned long long)g_presentFrameNumber,
+                    left.poseSerial, left.presentAtProduce,
+                    right.poseSerial, right.presentAtProduce);
+            return originalHr;
+        }
+
+        IDirect3DSurface9* oldRt = nullptr;
+        D3DVIEWPORT9 oldVp{};
+        if (FAILED(device->GetRenderTarget(0, &oldRt)) || !oldRt)
+            return originalHr;
+        if (FAILED(device->GetViewport(&oldVp)))
+        {
+            oldRt->Release();
+            return originalHr;
+        }
+        // Keep the game's depth/stencil state. The saved color targets are the
+        // same dimensions and format as the just-captured world surface.
+        //
+        // Historical r236 Family B replay changed only X/Width for each SBS
+        // half. The first NewSequentialStereo test instead forced X/Y/Width/Height to the
+        // whole eye texture. That can discard a legitimate late-Canvas
+        // viewport origin/letterbox and move the prompt relative to the world.
+        // Try retaining Y and Height (and any valid X/Width) here; retain the
+        // original full-texture behavior behind an INI switch for A/B testing.
+        D3DVIEWPORT9 eyeVp = oldVp;
+        if (g_newSequentialStereoPromptPreserveViewport)
+        {
+            if (!eyeVp.Width || eyeVp.X >= g_stereoCopyWidth) eyeVp.X = 0;
+            if (!eyeVp.Height || eyeVp.Y >= g_stereoCopyHeight) eyeVp.Y = 0;
+            eyeVp.Width = (std::min)(eyeVp.Width ? eyeVp.Width : g_stereoCopyWidth,
+                g_stereoCopyWidth - eyeVp.X);
+            eyeVp.Height = (std::min)(eyeVp.Height ? eyeVp.Height : g_stereoCopyHeight,
+                g_stereoCopyHeight - eyeVp.Y);
+        }
+        else
+        {
+            eyeVp.X = eyeVp.Y = 0;
+            eyeVp.Width = g_stereoCopyWidth;
+            eyeVp.Height = g_stereoCopyHeight;
+        }
+        // Debug-only: determine whether this is a viewport mismatch at all.
+        // If original and replay viewports are identical, any moving offset
+        // must come from projection/pose or the source Canvas draw coordinates.
+        static unsigned int viewportSamples = 0;
+        ++viewportSamples;
+        if (g_debugToolsEnabled && (viewportSamples <= 12u || viewportSamples % 360u == 0))
+        {
+            D3DSURFACE_DESC rtDesc{};
+            oldRt->GetDesc(&rtDesc);
+            IDirect3DVertexShader9* vs = nullptr;
+            IDirect3DPixelShader9* ps = nullptr;
+            device->GetVertexShader(&vs);
+            device->GetPixelShader(&ps);
+            DWORD fvf = 0, zEnable = 0;
+            device->GetFVF(&fvf);
+            device->GetRenderState(D3DRS_ZENABLE, &zEnable);
+            LogCategory("UI", "NEW_SEQUENTIAL_STEREO_PROMPT_VIEWPORT n=%u src=%u,%u %ux%u rt=%ux%u replay=%u,%u %ux%u eye=%ux%u preserve=%d fvf=0x%08X z=%u VS=%p PS=%p",
+                viewportSamples,
+                oldVp.X, oldVp.Y, oldVp.Width, oldVp.Height,
+                rtDesc.Width, rtDesc.Height,
+                eyeVp.X, eyeVp.Y, eyeVp.Width, eyeVp.Height,
+                g_stereoCopyWidth, g_stereoCopyHeight,
+                g_newSequentialStereoPromptPreserveViewport ? 1 : 0,
+                (unsigned)fvf, (unsigned)zEnable, vs, ps);
+            if (vs) vs->Release();
+            if (ps) ps->Release();
+        }
+        int replayed = 0;
+        for (int eye = 0; eye < 2; ++eye)
+        {
+            IDirect3DTexture9* eyeTexture = eye ? g_rightEyeCopy : g_leftEyeCopy;
+            IDirect3DSurface9* eyeRt = nullptr;
+            if (SUCCEEDED(eyeTexture->GetSurfaceLevel(0, &eyeRt)) && eyeRt)
+            {
+                if (SUCCEEDED(device->SetRenderTarget(0, eyeRt)) &&
+                    SUCCEEDED(device->SetViewport(&eyeVp)))
+                {
+                    if (SUCCEEDED(drawOriginal())) ++replayed;
+                }
+                eyeRt->Release();
+            }
+        }
+        device->SetRenderTarget(0, oldRt);
+        device->SetViewport(&oldVp);
+        oldRt->Release();
+
+        static unsigned int replayEvents = 0;
+        ++replayEvents;
+        if (g_debugToolsEnabled && (replayEvents <= 24 || (replayEvents % 600u) == 0))
+            LogCategory("UI", "NEW_SEQUENTIAL_STEREO_FAMILY_B_REPLAY n=%u frame=%llu copied=%d/2 pose=%llu present=%llu",
+                replayEvents, (unsigned long long)g_presentFrameNumber,
+                replayed, left.poseSerial, left.presentAtProduce);
+        return originalHr;
+    }
+
     static bool IsUiCandidateGameFramebuffer(int candidateIndex)
     {
         if (candidateIndex < 0 || candidateIndex >= static_cast<int>(g_uiCandidateCount)) return false;
@@ -167,6 +316,7 @@
     static HRESULT STDMETHODCALLTYPE HookedHudDrawPrimitive(
         IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount)
     {
+        if (NewSequentialStereoSkipSecondUiDraw()) return D3D_OK;
         HudWindowRecordD3D("DP", self, type, primitiveCount);
         const bool insideUiScope =
             InterlockedCompareExchange(&g_insideRedirectedUiFlush, 0, 0) != 0;
@@ -189,7 +339,8 @@
                 (insideUiScope || IsUiCandidateSelected(candidateIndex)));
         UiAlphaBlendState alphaState{};
         if (redirected) BeginMirroredUiAlpha(self, alphaState);
-        const bool familyBMono = !redirected && IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2;
+        const bool familyBMono = !g_newSequentialStereoEnabled &&
+            !redirected && IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2;
         D3DVIEWPORT9 familyBVp{};
         if (familyBMono)
         {
@@ -198,7 +349,9 @@
             familyBVp.Width = g_nativeVrWidth / 2;
             self->SetViewport(&familyBVp);
         }
-        HRESULT hr = g_originalHudDrawPrimitive(self, type, startVertex, primitiveCount);
+        HRESULT hr = NewSequentialStereoReplayLateFamilyB(self, candidateIndex, [&]() {
+            return g_originalHudDrawPrimitive(self, type, startVertex, primitiveCount);
+        });
         if (familyBMono && SUCCEEDED(hr))
         {
             familyBVp.X = g_nativeVrWidth / 2;
@@ -218,6 +371,7 @@
     static HRESULT STDMETHODCALLTYPE HookedHudDrawPrimitiveUP(
         IDirect3DDevice9* self, D3DPRIMITIVETYPE type, UINT primitiveCount, const void* data, UINT stride)
     {
+        if (NewSequentialStereoSkipSecondUiDraw()) return D3D_OK;
         HudWindowRecordD3D("DPUP", self, type, primitiveCount, stride);
         const bool insideUiScope =
             InterlockedCompareExchange(&g_insideRedirectedUiFlush, 0, 0) != 0;
@@ -240,7 +394,8 @@
                 (insideUiScope || IsUiCandidateSelected(candidateIndex)));
         UiAlphaBlendState alphaState{};
         if (redirected) BeginMirroredUiAlpha(self, alphaState);
-        const bool familyBMono = !redirected && IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2;
+        const bool familyBMono = !g_newSequentialStereoEnabled &&
+            !redirected && IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2;
         D3DVIEWPORT9 familyBVp{};
         if (familyBMono)
         {
@@ -249,7 +404,9 @@
             familyBVp.Width = g_nativeVrWidth / 2;
             self->SetViewport(&familyBVp);
         }
-        HRESULT hr = g_originalHudDrawPrimitiveUP(self, type, primitiveCount, data, stride);
+        HRESULT hr = NewSequentialStereoReplayLateFamilyB(self, candidateIndex, [&]() {
+            return g_originalHudDrawPrimitiveUP(self, type, primitiveCount, data, stride);
+        });
         if (familyBMono && SUCCEEDED(hr))
         {
             familyBVp.X = g_nativeVrWidth / 2;
@@ -282,7 +439,7 @@
         // through the generic UE3 wrapper at RVA 0xA1E1A6. The useful discriminator
         // is the caller ABOVE that wrapper. Focus on the known Canvas/UI-like
         // stride-48 quad path so stride-12 geometry cannot exhaust the log cap.
-        if (stride != 48 || g_globalDipupCallerLogCount >= 128)
+        if (!g_debugToolsEnabled || stride != 48 || g_globalDipupCallerLogCount >= 128)
             return;
 
         HMODULE exe = GetModuleHandleW(nullptr);
@@ -356,6 +513,7 @@
         if (!original)
             return D3DERR_INVALIDCALL;
 
+        if (NewSequentialStereoSkipSecondUiDraw()) return D3D_OK;
         HMODULE exe = GetModuleHandleW(nullptr);
         const uintptr_t base = reinterpret_cast<uintptr_t>(exe);
         const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -387,9 +545,51 @@
             (insideUiScope || selectedCandidate) &&
             g_nativeVrColorSurface && self;
 
+        // Live, bounded geometry census. A D3D9 vertex Y outside the 16:9
+        // source RECT is evidence of possible clipping, not by itself proof
+        // of final pixel coverage: shaders can transform vertex positions.
+        // The known Family B family is included so we can distinguish its
+        // intentional world-eye replay from genuinely detached HUD draws.
+        if (CanvasTraceIsActive() && (insideUiScope || IsUiCandidateFamilyB(candidateIndex)) &&
+            g_canvasTraceDrawLogCount < 750)
+        {
+            float minY = 0.0f, maxY = 0.0f, minX = 0.0f, maxX = 0.0f;
+            if (stride == 48 && vertexData && numVertices > 0 && numVertices < 4096)
+            {
+                const float* v = reinterpret_cast<const float*>(vertexData);
+                minX = maxX = v[0];
+                minY = maxY = v[1];
+                for (UINT i = 1; i < numVertices; ++i)
+                {
+                    const float* q = reinterpret_cast<const float*>(
+                        static_cast<const unsigned char*>(vertexData) +
+                        static_cast<size_t>(i) * stride);
+                    minX = (std::min)(minX, q[0]);
+                    maxX = (std::max)(maxX, q[0]);
+                    minY = (std::min)(minY, q[1]);
+                    maxY = (std::max)(maxY, q[1]);
+                }
+            }
+            const unsigned int cropHeight = NewSequentialStereoCroppedUiHeight(
+                g_nativeVrWidth, g_nativeVrHeight);
+            LogCategory("UI", "CANVAS_TRACE_DRAW frame=%llu batch=%p "
+                "candidate=%d familyB=%d inScope=%d detached=%d "
+                "stride=%u verts=%u prim=%u xy=[%.1f %.1f -> %.1f %.1f] "
+                "beyondCrop=%d cropY=%u",
+                g_presentFrameNumber, g_canvasTraceActiveBatch,
+                candidateIndex, IsUiCandidateFamilyB(candidateIndex) ? 1 : 0,
+                insideUiScope ? 1 : 0, uiDraw ? 1 : 0,
+                stride, numVertices, primitiveCount,
+                minX, minY, maxX, maxY,
+                (stride == 48 && vertexData && maxY > static_cast<float>(cropHeight)) ? 1 : 0,
+                cropHeight);
+            ++g_canvasTraceDrawLogCount;
+        }
+
         if (!uiDraw)
         {
-            if (IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2 && self)
+            if (!g_newSequentialStereoEnabled &&
+                IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2 && self)
             {
                 D3DVIEWPORT9 originalVp{};
                 if (SUCCEEDED(self->GetViewport(&originalVp)))
@@ -413,9 +613,10 @@
                     return hr;
                 }
             }
-            return original(
-                self, type, minVertexIndex, numVertices, primitiveCount,
-                indexData, indexFormat, vertexData, stride);
+            return NewSequentialStereoReplayLateFamilyB(self, candidateIndex, [&]() {
+                return original(self, type, minVertexIndex, numVertices,
+                    primitiveCount, indexData, indexFormat, vertexData, stride);
+            });
         }
 
         // r188c: Native Stereo's shared Canvas pass emits a full-SBS 1x1-texture
@@ -547,6 +748,15 @@
         // g_uiFinalSurface is created at the native VR target dimensions, so
         // the existing attachment remains compatible with this redirect.
         self->SetDepthStencilSurface(oldDepth);
+        // Important: keep the D3D9 *raster viewport* at the full native
+        // dimensions. UE3's Canvas shaders already convert logical pixel
+        // coordinates using the native backbuffer size. V1 also reduced the
+        // raster viewport height to the cropped Canvas height: that applied
+        // a second vertical scale, confining a ~1148px Canvas to only ~633px
+        // in the captured UI image (the "top half of the panel" symptom).
+        // The HUD-only logical height is adjusted by the Canvas/FViewport hooks;
+        // Vulkan's UI source RECT samples only that top 16:9 region. No world
+        // viewport or projection is modified by this UI redirect.
         D3DVIEWPORT9 uiVp{ 0,0,desc.Width,desc.Height,0.0f,1.0f };
         self->SetViewport(&uiVp);
 
@@ -569,6 +779,7 @@
 
         const bool afrRedirectedCanvasDraw =
             uiDraw &&
+            !g_newSequentialStereoEnabled &&
             !g_nativeStereoEnabled &&
             g_alternatingStereoEnabled &&
             stride == 48 &&
@@ -761,7 +972,8 @@
         // if the alternating black half disappears, this draw is the source.
         bool suppressAfrHalfScreenQuad = false;
 
-        if (!g_nativeStereoEnabled &&
+        if (!g_newSequentialStereoEnabled &&
+            !g_nativeStereoEnabled &&
             g_alternatingStereoEnabled &&
             stride == 48 &&
             vertexData &&
@@ -841,6 +1053,7 @@
         //
         if (!suppressAfrHalfScreenQuad &&
             uiDraw &&
+            !g_newSequentialStereoEnabled &&
             !g_nativeStereoEnabled &&
             g_alternatingStereoEnabled &&
             stride == 48 &&
@@ -987,7 +1200,7 @@
 
         const bool familyBMono =
             !suppressAfrHalfScreenQuad &&
-            IsUiCandidateFamilyB(candidateIndex) &&
+            !g_newSequentialStereoEnabled && IsUiCandidateFamilyB(candidateIndex) &&
             g_nativeVrWidth >= 2;
         D3DVIEWPORT9 familyBVp{};
         if (familyBMono)
@@ -1361,6 +1574,9 @@
         // g_uiFinalSurface is created at the native VR target dimensions, so
         // the existing attachment remains compatible with this redirect.
         self->SetDepthStencilSurface(*oldDepth);
+        // The UI capture region is cropped at submission, not by changing
+        // the raster viewport. Keeping native viewport height prevents the
+        // second vertical scaling that compressed UI into the panel's top half.
         D3DVIEWPORT9 vp{ 0,0,desc.Width,desc.Height,0.0f,1.0f };
         self->SetViewport(&vp);
 
@@ -1397,6 +1613,7 @@
         UINT StartIndex,
         UINT PrimitiveCount)
     {
+        if (NewSequentialStereoSkipSecondUiDraw()) return D3D_OK;
         HudWindowRecordD3D("DIP", self, Type, PrimitiveCount);
 
 
@@ -1458,7 +1675,8 @@
         UiAlphaBlendState alphaState{};
         if (uiRedirect) BeginMirroredUiAlpha(self, alphaState);
 
-        const bool familyBMono = !uiRedirect && IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2;
+        const bool familyBMono = !g_newSequentialStereoEnabled &&
+            !uiRedirect && IsUiCandidateFamilyB(candidateIndex) && g_nativeVrWidth >= 2;
         D3DVIEWPORT9 familyBVp{};
         if (familyBMono)
         {
@@ -1468,8 +1686,10 @@
             self->SetViewport(&familyBVp);
         }
 
-        HRESULT hr = g_originalDrawIndexedPrimitive(
-            self, Type, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount);
+        HRESULT hr = NewSequentialStereoReplayLateFamilyB(self, candidateIndex, [&]() {
+            return g_originalDrawIndexedPrimitive(self, Type, BaseVertexIndex,
+                MinVertexIndex, NumVertices, StartIndex, PrimitiveCount);
+        });
         if (familyBMono && SUCCEEDED(hr))
         {
             familyBVp.X = g_nativeVrWidth / 2;

@@ -66,9 +66,7 @@ inline void LogInit() {
 
     std::fprintf(f, "============================================================\n");
     std::fprintf(f, "HATVR SESSION START\n");
-    std::fprintf(f, "BUILD: PHASE8.5 + CLEAN_RUNTIME_1\n");
-    std::fprintf(f, "BUILD ID: 2026-09-20-CLEAN\n");
-    std::fprintf(f, "FEATURES: DIRECT_SBS=1 UI_STAGING=1 GPU_ONLY=1 CENTRAL_LOG=1\n");
+    std::fprintf(f, "BUILD: HatVR 0.20\n");
     std::fprintf(f, "PROCESS ID: %lu\n", static_cast<unsigned long>(pid));
     std::fprintf(f, "LOCAL START: %04u-%02u-%02u %02u:%02u:%02u.%03u\n",
         st.wYear, st.wMonth, st.wDay,
@@ -76,7 +74,7 @@ inline void LogInit() {
     std::fprintf(f, "LOG FILE: %s\n", log_detail::Path());
     if (modulePath[0])
         std::fprintf(f, "MODULE: %s\n", modulePath);
-    std::fprintf(f, "LOGGING: centralized; verbose diagnostics disabled\n");
+    std::fprintf(f, "LOGGING: centralized release log\n");
     std::fprintf(f, "============================================================\n");
     std::fflush(f);
 }
@@ -92,7 +90,14 @@ inline bool IsReleaseLogNoise(const char* fmt) {
         "c12 = [", "c13 = [", "c14 = [", "c15 = [",
         "FLUSH hit=", "DIPUP48 hit=", "PERIODIC GetPlayerViewPoint",
         "PERIODIC CalcSceneView", "FP_V126_ROT", "V38 SOURCE-VIEWS",
-        "FP_OCCLUSION] semantic match", "V10 BeginOpenXRFrameForRender call="
+        "FP_OCCLUSION] semantic match", "V10 BeginOpenXRFrameForRender call=",
+        "V47 QUAD", "V45 RHI-SETVP", "AV_PERF_V2", "AFR_UI_C1_NORMALIZE",
+        "AFR_CANVAS_TRANSFORM", "CANVAS_FLUSH_BOUNDARY", "semantic match PS=",
+        "VKXR-TIMING", "VKBRIDGE-V5 PHASE8 GPU-COPY", "VKBRIDGE-V5 PHASE8 DIRECT-SBS-CROP",
+        "HOTFIX-VERIFY V", "HOTFIX-DIAG D", "DXVK-V8: structural candidate",
+        "DXVK-V8: candidate=", "VKXR-NEW_SEQUENTIAL_STEREO reuse last released eyes",
+        "PHASE8.3 CALC-PATH", "V139 GAMEPLAY_FAMILY", "V154 GENUINE_CALC_PAIR",
+        "NEW_SEQUENTIAL_STEREO_PAIR skip stamps=", "AV_V37_MASTER_RESET debug="
     };
     for (const char* p : noisy) if (std::strstr(fmt, p)) return true;
     return false;

@@ -18,7 +18,6 @@
     using HudWindowResolverFn = void* (*)(void*, void*, unsigned int);
     static HudWindowResolverFn g_originalHudWindowResolver = nullptr;
     static bool g_hudWindowResolverInstalled = false;
-    static volatile LONG g_insideHudWindow = 0;
     static unsigned long long g_hudWindowSerial = 0;
     static unsigned int g_hudWindowLogLines = 0;
     static void* HookedHudWindowResolver(void* a, void* b, unsigned int c)
@@ -29,7 +28,7 @@
         {
             InterlockedExchange(&g_insideHudWindow, 1);
             ++g_hudWindowSerial;
-            if (g_hudWindowLogLines < 256) {
+            if (g_debugToolsEnabled && g_hudWindowLogLines < 256) {
                 char line[160] = {};
                 sprintf_s(line, sizeof(line), "BEGIN serial=%llu returnRVA=0x5D93CA\n", g_hudWindowSerial);
                 HudWindowLog(line); ++g_hudWindowLogLines;
@@ -57,7 +56,9 @@
         D3DPRIMITIVETYPE primType = static_cast<D3DPRIMITIVETYPE>(0),
         UINT primCount = 0, UINT stride = 0, DWORD stage = 0, void* object = nullptr)
     {
-        if (InterlockedCompareExchange(&g_insideHudWindow, 0, 0) == 0 || g_hudWindowLogLines >= 256)
+        if (!g_debugToolsEnabled ||
+            InterlockedCompareExchange(&g_insideHudWindow, 0, 0) == 0 ||
+            g_hudWindowLogLines >= 256)
             return;
 
         D3DVIEWPORT9 vp{};
@@ -104,6 +105,22 @@
     static unsigned long long g_canvasUiClearedFrame = ~0ULL;
     static unsigned int g_canvasUiRedirectLogCount = 0;
     static volatile LONG g_insideRedirectedUiFlush = 0;
+    // Opt-in, bounded live Canvas provenance census. Ctrl+Shift+F8 with
+    // DebugToolsEnabled=true records the NEXT 240 Present frames; it does not
+    // modify renderer state or route any draw differently.
+    static unsigned long long g_canvasTraceUntilFrame = 0;
+    static unsigned int g_canvasTraceFlushLogCount = 0;
+    static unsigned int g_canvasTraceDrawLogCount = 0;
+    static unsigned int g_canvasTraceFinalizeLogCount = 0;
+    static bool g_canvasTraceF8WasDown = false;
+    static const void* g_canvasTraceActiveBatch = nullptr;
+
+    static bool CanvasTraceIsActive()
+    {
+        return g_debugToolsEnabled &&
+            g_canvasTraceUntilFrame != 0 &&
+            g_presentFrameNumber < g_canvasTraceUntilFrame;
+    }
     // Interactive out-of-scope UI family classifier.
     //
     // A candidate is keyed only by its main-EXE call stack.  Shader/texture and
@@ -293,6 +310,17 @@
         UiCandidateLog(line);
     }
 
+    // The second NewSequentialStereo scene must render its world, but the flat Canvas UI
+    // must not accumulate a second copy in HatVR's mono OpenXR UI surface.
+    // Only the proven redirected Canvas window is skipped. A HUD-associated
+    // 3D/world-space draw OUTSIDE this scope must still render for both eyes.
+    static bool NewSequentialStereoSkipSecondUiDraw()
+    {
+        return g_newSequentialStereoEnabled && g_newSequentialStereoHudSinglePass &&
+            g_v26InsideDraw && g_v26SecondPass &&
+            InterlockedCompareExchange(&g_insideRedirectedUiFlush, 0, 0) != 0;
+    }
+
     static int IdentifyUiDrawCandidate(
         IDirect3DDevice9* device, unsigned int drawOp,
         UINT stride, UINT vertices, UINT primitives)
@@ -375,9 +403,8 @@
                 // Pre-hotfix confirmed UI families.
                 hash == 0xD2EFE7F4500173ECULL ||
                 hash == 0xF00EF310FF49C295ULL ||
-                // Steam Build 25577316: additional UI family found during
-                // release-candidate UI discovery (candidate 87).
-                hash == 0xABB64F60A774AAB8ULL ||
+                // 0xABB64F60A774AAB8 is a game/particle draw family, not UI.
+                // Do not hardcode it into the detached OpenXR panel.
                 // Steam Build 25577316 hotfix equivalents of those exact
                 // call-stack families.  The game update relocated the EXE
                 // return RVAs, so the FNV stack hashes changed even though
@@ -464,6 +491,24 @@
         if (g_hatVrGameWindow && GetForegroundWindow() != g_hatVrGameWindow) return;
         const bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
         const bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        const bool canvasTraceHotkey =
+            (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
+            (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (canvasTraceHotkey && !g_canvasTraceF8WasDown)
+        {
+            g_canvasTraceUntilFrame = g_presentFrameNumber + 240ULL;
+            g_canvasTraceFlushLogCount = 0;
+            g_canvasTraceDrawLogCount = 0;
+            g_canvasTraceFinalizeLogCount = 0;
+            LogCategory("UI", "CANVAS_TRACE_START frame=%llu until=%llu "
+                "native=%ux%u crop=%u sharedOnly=%d",
+                g_presentFrameNumber, g_canvasTraceUntilFrame,
+                g_nativeVrWidth, g_nativeVrHeight,
+                NewSequentialStereoCroppedUiHeight(g_nativeVrWidth, g_nativeVrHeight),
+                0); // split-Canvas mode retired; retained trace field for parsers
+        }
+        g_canvasTraceF8WasDown = canvasTraceHotkey;
         const bool insertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
         const bool deleteDown = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
         const bool homeDown = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
@@ -555,7 +600,29 @@
             g_nativeVrWidth && g_nativeVrHeight &&
             returnRva == 0x760236 &&
             viewportWidth == g_nativeVrWidth &&
-            arg4 == static_cast<unsigned long long>(g_nativeVrHeight);
+            (arg4 == static_cast<unsigned long long>(g_nativeVrHeight) ||
+             (NewSequentialStereoCroppedUiHeight(g_nativeVrWidth, g_nativeVrHeight) &&
+              arg4 == static_cast<unsigned long long>(
+                  NewSequentialStereoCroppedUiHeight(g_nativeVrWidth, g_nativeVrHeight))));
+
+        // In the 2026 executable, RVA 0x760200 passes [command+8] as
+        // batch/RCX, and batch+0x1E0 as context/RDX to 0x7A19C0. Log both;
+        // this is an identity for render-command backing data, NOT evidence
+        // that the most recent Canvas finalization owns the queued geometry.
+        if (CanvasTraceIsActive() && returnRva == 0x760236 &&
+            g_canvasTraceFlushLogCount++ < 600)
+        {
+            LogCategory("UI", "CANVAS_TRACE_FLUSH frame=%llu batch=%p "
+                "ctx=0x%llX ctxOffset1e0=%d size=%ux%llu "
+                "c0=%d q08=%d q18=%d q28=%d q3c=%d q4c=%d "
+                "phase=UNRESOLVED redirect=%d",
+                g_presentFrameNumber, batch,
+                static_cast<unsigned long long>(transformOrContext),
+                batch && static_cast<unsigned long long>(transformOrContext) ==
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(batch) + 0x1E0) ? 1 : 0,
+                viewportWidth, static_cast<unsigned long long>(arg4),
+                qC0, q08, q18, q28, q3c, q4c, redirect ? 1 : 0);
+        }
 
         // Use only state already visible in this module; do not depend on the
         // D3D device global or mutate renderer-owned state.
@@ -586,10 +653,13 @@
         // internal RHI/state work that can replace our target. Mark the exact flush
         // instead; the low-level stride-48 DIPUP hook below redirects each actual
         // draw at the moment it reaches D3D9.
+        const void* priorTraceBatch = g_canvasTraceActiveBatch;
+        g_canvasTraceActiveBatch = batch;
         InterlockedExchange(&g_insideRedirectedUiFlush, 1);
         const unsigned long long result =
             g_originalCanvasBatchFlush(batch, transformOrContext, viewportWidth, arg4, arg5, arg6);
         InterlockedExchange(&g_insideRedirectedUiFlush, 0);
+        g_canvasTraceActiveBatch = priorTraceBatch;
 
         if (g_canvasUiRedirectLogCount < 96)
         {
@@ -662,6 +732,20 @@
         const unsigned int savedY = *sizeYSlot;
         bool changed = false;
 
+        // Release fallback: use the same 16:9 logical Canvas height for
+        // BOTH per-player and shared phases. The experimental split caused
+        // full-height per-player UI to be clipped by the OpenXR HUD panel.
+        // Keep the Family B both-eye replay; its imperfect prompt projection
+        // is an acknowledged 0.20 known issue. Do not alter world projection.
+        const unsigned int cropHeight =
+            NewSequentialStereoCroppedUiHeight(g_nativeVrWidth, g_nativeVrHeight);
+        if (cropHeight && savedX == g_nativeVrWidth &&
+            savedY == g_nativeVrHeight)
+        {
+            *sizeYSlot = cropHeight;
+            changed = true;
+        }
+
         // Per-player Canvas logical-width normalization only.
         // the HUD shift, but changing renderer-owned view state breaks AFR.
         if (associatedView &&
@@ -694,6 +778,24 @@
 
         g_originalCanvasFinalizeCandidate(canvasObject);
 
+        // Verified in 2026 HatinTimeGame.exe: RVA 0x768AD0 copies the
+        // integer SizeX/SizeY (+0x90/+0x94) into persistent float
+        // ClipX/ClipY (+0x70/+0x74) AFTER its virtual call. Restoring the
+        // integers does not restore these cached floats. Trace the active
+        // all-phase crop without changing these game-owned cached fields.
+        if (CanvasTraceIsActive() && g_canvasTraceFinalizeLogCount++ < 300)
+        {
+            const float cachedX = *reinterpret_cast<const float*>(c + 0x70);
+            const float cachedY = *reinterpret_cast<const float*>(c + 0x74);
+            LogCategory("UI", "CANVAS_TRACE_FINALIZE frame=%llu canvas=%p "
+                "phase=%s view=%p nativeSlot=%ux%u submittedSlot=%ux%u "
+                "postClip=%.1fx%.1f renderTarget=%p",
+                g_presentFrameNumber, canvasObject,
+                associatedView ? "PER_PLAYER" : "SHARED", associatedView,
+                savedX, savedY, *sizeXSlot, *sizeYSlot,
+                cachedX, cachedY, *reinterpret_cast<void**>(c + 0x18));
+        }
+
         // keep this test local to FUN_140768610.  UE3's CanvasObject is restored
         // immediately so later shared-HUD setup sees its normal state.
         if (changed)
@@ -706,7 +808,7 @@
             *reinterpret_cast<void**>(static_cast<unsigned char*>(canvasObject) + 0xA4) == nullptr &&
             InterlockedExchange(&g_insideHudWindow, 0) != 0)
         {
-            if (g_hudWindowLogLines < 256)
+            if (g_debugToolsEnabled && g_hudWindowLogLines < 256)
             {
                 char line[128] = {};
                 sprintf_s(line, sizeof(line), "END serial=%llu at SHARED Canvas\n", g_hudWindowSerial);

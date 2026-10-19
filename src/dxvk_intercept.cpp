@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 #include <cstdio>
+#include <initializer_list>
 
 #include "d3d9_backend.h"
 #include "d3d9_hook.h"
@@ -267,6 +268,167 @@ namespace
     std::atomic<bool> g_v6DiscoveryStarted{ false };
     std::atomic<bool> g_v6DeviceAttached{ false };
 
+    // The DXVK factory can run before HatVR loads, so Direct3DCreate9
+    // interception isn't enough. Catch the *live* device when DXVK actually
+    // draws a frame, rather than guessing its heap location.
+    using DevicePresentFn = HRESULT (STDMETHODCALLTYPE*)(
+        IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+    using DeviceEndSceneFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*);
+
+    DevicePresentFn g_v8OriginalProbePresent = nullptr;
+    DeviceEndSceneFn g_v8OriginalProbeEndScene = nullptr;
+    void* g_v8ProbePresentTarget = nullptr;
+    void* g_v8ProbeEndSceneTarget = nullptr;
+    std::atomic<IDirect3DDevice9*> g_v8CapturedDevice{ nullptr };
+    std::atomic<unsigned> g_v8InProbe{ 0 };
+    std::atomic<unsigned> g_v8ProbeCallCount{ 0 };
+    std::atomic<bool> g_v8ProbeArmed{ false };
+
+    void V8RememberLiveDevice(IDirect3DDevice9* device, const char* from)
+    {
+        if (!device || !g_v8ProbeArmed.load(std::memory_order_acquire) ||
+            g_v6DeviceAttached.load(std::memory_order_acquire) ||
+            g_v8CapturedDevice.load(std::memory_order_acquire))
+            return;
+
+        // Keep the device alive until the discovery worker can validate it.
+        // This is a real method invocation from the game's DXVK device.
+        device->AddRef();
+        IDirect3DDevice9* empty = nullptr;
+        if (!g_v8CapturedDevice.compare_exchange_strong(
+                empty, device, std::memory_order_acq_rel))
+        {
+            device->Release();
+            return;
+        }
+        V5Trace("DXVK-LIVE: captured device=%p via %s; validating on discovery thread",
+            device, from);
+    }
+
+    HRESULT STDMETHODCALLTYPE V8ProbePresent(IDirect3DDevice9* device,
+        const RECT* source, const RECT* dest, HWND window, const RGNDATA* dirty)
+    {
+        g_v8InProbe.fetch_add(1, std::memory_order_acq_rel);
+        g_v8ProbeCallCount.fetch_add(1, std::memory_order_relaxed);
+        V8RememberLiveDevice(device, "Present");
+        auto original = g_v8OriginalProbePresent;
+        HRESULT hr = original ? original(device, source, dest, window, dirty) : D3DERR_INVALIDCALL;
+        g_v8InProbe.fetch_sub(1, std::memory_order_acq_rel);
+        return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE V8ProbeEndScene(IDirect3DDevice9* device)
+    {
+        g_v8InProbe.fetch_add(1, std::memory_order_acq_rel);
+        g_v8ProbeCallCount.fetch_add(1, std::memory_order_relaxed);
+        V8RememberLiveDevice(device, "EndScene");
+        auto original = g_v8OriginalProbeEndScene;
+        HRESULT hr = original ? original(device) : D3DERR_INVALIDCALL;
+        g_v8InProbe.fetch_sub(1, std::memory_order_acq_rel);
+        return hr;
+    }
+
+    bool V8InstallLiveFrameProbes(void** vtable)
+    {
+        if (!vtable)
+            return false;
+
+        struct Probe {
+            int slot;
+            void* replacement;
+            void** original;
+            void** target;
+            const char* name;
+        } probes[] = {
+            {17, reinterpret_cast<void*>(&V8ProbePresent),
+                reinterpret_cast<void**>(&g_v8OriginalProbePresent),
+                &g_v8ProbePresentTarget, "Present"},
+            {42, reinterpret_cast<void*>(&V8ProbeEndScene),
+                reinterpret_cast<void**>(&g_v8OriginalProbeEndScene),
+                &g_v8ProbeEndSceneTarget, "EndScene"},
+        };
+
+        bool any = false;
+        for (auto& probe : probes)
+        {
+            void* target = vtable[probe.slot];
+            MH_STATUS st = MH_CreateHook(target, probe.replacement, probe.original);
+            if (st != MH_OK)
+            {
+                V5Trace("DXVK-LIVE: %s MH_CreateHook failed status=%d target=%p",
+                    probe.name, static_cast<int>(st), target);
+                continue;
+            }
+            *probe.target = target;
+            st = MH_EnableHook(target);
+            if (st == MH_OK || st == MH_ERROR_ENABLED)
+            {
+                any = true;
+                V5Trace("DXVK-LIVE: %s probe ACTIVE target=%p", probe.name, target);
+            }
+            else
+            {
+                V5Trace("DXVK-LIVE: %s MH_EnableHook failed status=%d",
+                    probe.name, static_cast<int>(st));
+                MH_RemoveHook(target);
+                *probe.target = nullptr;
+            }
+        }
+        g_v8ProbeArmed.store(any, std::memory_order_release);
+        return any;
+    }
+
+    // Must release the Present entrypoint before HookDevice installs its real
+    // renderer hook on exactly that function. Do this off the render thread.
+    bool V8RemoveLiveFrameProbes()
+    {
+        g_v8ProbeArmed.store(false, std::memory_order_release);
+        bool ok = true;
+        for (void* target : {g_v8ProbePresentTarget, g_v8ProbeEndSceneTarget})
+        {
+            if (!target)
+                continue;
+            MH_STATUS st = MH_DisableHook(target);
+            if (st != MH_OK && st != MH_ERROR_DISABLED)
+            {
+                V5Trace("DXVK-LIVE: failed disabling probe target=%p status=%d",
+                    target, static_cast<int>(st));
+                ok = false;
+            }
+        }
+        if (!ok)
+            return false;
+
+        // The hooks are disabled, so no new invocations should enter. A call
+        // already in the trampoline must finish before MinHook frees it.
+        for (unsigned i = 0; i < 2000 &&
+             g_v8InProbe.load(std::memory_order_acquire) != 0; ++i)
+            Sleep(1);
+        if (g_v8InProbe.load(std::memory_order_acquire) != 0)
+        {
+            V5Trace("DXVK-LIVE: probe callback still active, leaving trampolines intact");
+            return false;
+        }
+        for (void** slot : {&g_v8ProbePresentTarget, &g_v8ProbeEndSceneTarget})
+        {
+            void* target = *slot;
+            if (!target)
+                continue;
+            MH_STATUS st = MH_RemoveHook(target);
+            if (st != MH_OK)
+            {
+                V5Trace("DXVK-LIVE: failed removing probe target=%p status=%d",
+                    target, static_cast<int>(st));
+                ok = false;
+            }
+            else
+                *slot = nullptr;
+        }
+        if (ok)
+            V5Trace("DXVK-LIVE: startup probes removed; renderer can own Present");
+        return ok;
+    }
+
     bool V6IsExecutableAddress(void* p)
     {
         if (!p)
@@ -453,88 +615,197 @@ namespace
 
         V5Trace("DXVK-V8: scanning for structurally valid DXVK D3D9 objects; dxvk=%p", dxvk);
 
+        // The proxy can bootstrap before the game has created its D3D9
+        // device. A single full-address-space scan then misses it forever.
+        // Retry briefly during startup, without running a permanent scanner.
         SYSTEM_INFO si{};
         GetSystemInfo(&si);
-        auto* addr = reinterpret_cast<unsigned char*>(si.lpMinimumApplicationAddress);
         auto* maxAddr = reinterpret_cast<unsigned char*>(si.lpMaximumApplicationAddress);
-        SIZE_T regions = 0, words = 0;
+        constexpr unsigned kMaxDiscoveryPasses = 9;
+        constexpr DWORD kDiscoveryRetryMs = 1500;
 
-        while (addr < maxAddr && !g_v6DeviceAttached.load(std::memory_order_acquire))
+        // The scanner is intentionally tied to the shipped DXVK build.
+        // Say so explicitly instead of silently scanning for a vtable which
+        // this process can never contain.
+        void** expectedVtable = reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(dxvk) + 0x662BA0);
+        if (!V6LooksLikeDxvkDeviceVtable(expectedVtable, dxvk))
         {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery(addr, &mbi, sizeof(mbi)))
+            V5Trace("DXVK-V8: device vtable fingerprint does not match the expected dxvk.dll build; discovery cannot attach until the matching DXVK is restored");
+            return 0;
+        }
+        V5Trace("DXVK-V8: shipped DXVK device vtable fingerprint matches; waiting for live device");
+
+        const bool liveProbesInstalled = V8InstallLiveFrameProbes(expectedVtable);
+        if (!liveProbesInstalled)
+            V5Trace("DXVK-LIVE: probes unavailable; using existing heap discovery only");
+
+        for (unsigned pass = 1; pass <= kMaxDiscoveryPasses &&
+                 !g_v6DeviceAttached.load(std::memory_order_acquire); ++pass)
+        {
+            if (pass != 1 && !g_v8CapturedDevice.load(std::memory_order_acquire))
+                Sleep(kDiscoveryRetryMs);
+            if (g_v6DeviceAttached.load(std::memory_order_acquire))
                 break;
 
-            auto* next = addr + mbi.RegionSize;
-            if (next <= addr)
-                break;
-
-            const DWORD p = mbi.Protect & 0xFF;
-            const bool readableWritable =
-                p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
-                p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
-
-            if (mbi.State == MEM_COMMIT && readableWritable &&
-                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-                mbi.RegionSize <= (256ull * 1024ull * 1024ull))
+            if (IDirect3DDevice9* live =
+                    g_v8CapturedDevice.exchange(nullptr, std::memory_order_acq_rel))
             {
-                ++regions;
-                __try
+                V5Trace("DXVK-LIVE: checking captured device=%p", live);
+                const bool verified = V8VerifyLiveD3D9Device(live);
+                if (verified)
                 {
-                    auto** begin = reinterpret_cast<void**>(mbi.BaseAddress);
-                    SIZE_T count = mbi.RegionSize / sizeof(void*);
-                    for (SIZE_T i = 0; i < count; ++i)
+                    if (!V8RemoveLiveFrameProbes())
                     {
-                        void** vt = reinterpret_cast<void**>(begin[i]);
-                        ++words;
-                        if (!V6AddressInModule(vt, dxvk))
-                            continue;
+                        V5Trace("DXVK-LIVE: cannot safely switch probe hooks to HatVR; attachment skipped");
+                        live->Release();
+                        return 0;
+                    }
+                    const bool attached = AttachExistingD3D9Device(live);
+                    live->Release();
+                    if (attached)
+                    {
+                        g_v6DeviceAttached.store(true, std::memory_order_release);
+                        V5Trace("DXVK-LIVE: VERIFIED LIVE DEVICE ATTACHED via render callback");
+                        return 0;
+                    }
+                    V5Trace("DXVK-LIVE: device valid but AttachExistingD3D9Device failed");
+                    return 0;
+                }
+                V5Trace("DXVK-LIVE: captured method device=%p failed swapchain verification", live);
+                live->Release();
+            }
 
-                        // A COM object's first machine word is its vtable pointer.
-                        // Validate the vtable structurally before treating this
-                        // address as IDirect3DDevice9.
-                        if (!V6LooksLikeDxvkDeviceVtable(vt, dxvk))
-                            continue;
+            auto* addr = reinterpret_cast<unsigned char*>(si.lpMinimumApplicationAddress);
+            SIZE_T regions = 0, words = 0;
+            while (addr < maxAddr && !g_v6DeviceAttached.load(std::memory_order_acquire) &&
+                !g_v8CapturedDevice.load(std::memory_order_acquire))
+            {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (!VirtualQuery(addr, &mbi, sizeof(mbi)))
+                    break;
 
-                        auto* candidate = reinterpret_cast<IDirect3DDevice9*>(&begin[i]);
-                        V5Trace("DXVK-V8: structural candidate object=%p vtable=%p Present=%p DIP=%p",
-                            candidate, vt, vt[17], vt[82]);
+                auto* next = addr + mbi.RegionSize;
+                if (next <= addr)
+                    break;
 
-                        LogCategory("DXVK", "HOTFIX-DIAG D02 structural candidate=%p; about to verify live device", candidate);
-                        if (!V8VerifyLiveD3D9Device(candidate))
+                const DWORD p = mbi.Protect & 0xFF;
+                const bool readableWritable =
+                    p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+                    p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+
+                if (mbi.State == MEM_COMMIT && readableWritable &&
+                    !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                    mbi.RegionSize <= (256ull * 1024ull * 1024ull))
+                {
+                    ++regions;
+                    __try
+                    {
+                        auto** begin = reinterpret_cast<void**>(mbi.BaseAddress);
+                        SIZE_T count = mbi.RegionSize / sizeof(void*);
+                        for (SIZE_T i = 0; i < count &&
+                             !g_v8CapturedDevice.load(std::memory_order_acquire); ++i)
                         {
-                            V5Trace("DXVK-V8: candidate REJECTED by live-device verification object=%p", candidate);
-                            continue;
-                        }
+                            void** vt = reinterpret_cast<void**>(begin[i]);
+                            ++words;
+                            if (!V6AddressInModule(vt, dxvk))
+                                continue;
 
-                        LogCategory("DXVK", "HOTFIX-DIAG D03 VERIFIED candidate=%p; about to call AttachExistingD3D9Device", candidate);
-                        V5Trace("DXVK-V11: VERIFIED LIVE IDirect3DDevice9 object=%p; installing normal core hooks + device hooks", candidate);
-                        const bool ok = AttachExistingD3D9Device(candidate);
-                        LogCategory("DXVK", "HOTFIX-DIAG D04 AttachExistingD3D9Device returned=%s candidate=%p", ok ? "TRUE" : "FALSE", candidate);
-                        V5Trace("DXVK-V11: AttachExistingD3D9Device=%s object=%p",
-                            ok ? "TRUE" : "FALSE", candidate);
+                            // A COM object's first machine word is its vtable pointer.
+                            // Validate the vtable structurally before treating this
+                            // address as IDirect3DDevice9.
+                            if (!V6LooksLikeDxvkDeviceVtable(vt, dxvk))
+                                continue;
 
-                        if (ok)
-                        {
-                            g_v6DeviceAttached.store(true, std::memory_order_release);
-                            V5Trace("DXVK-V11: VERIFIED LIVE DXVK DEVICE ATTACHED WITH CORE INIT");
-                            return 0;
+                            auto* candidate = reinterpret_cast<IDirect3DDevice9*>(&begin[i]);
+                            V5Trace("DXVK-V8: structural candidate object=%p vtable=%p Present=%p DIP=%p",
+                                candidate, vt, vt[17], vt[82]);
+
+                            LogCategory("DXVK", "HOTFIX-DIAG D02 structural candidate=%p; about to verify live device", candidate);
+                            if (!V8VerifyLiveD3D9Device(candidate))
+                            {
+                                V5Trace("DXVK-V8: candidate REJECTED by live-device verification object=%p", candidate);
+                                continue;
+                            }
+
+                            LogCategory("DXVK", "HOTFIX-DIAG D03 VERIFIED candidate=%p; about to call AttachExistingD3D9Device", candidate);
+                            V5Trace("DXVK-V11: VERIFIED LIVE IDirect3DDevice9 object=%p; installing normal core hooks + device hooks", candidate);
+                            if (liveProbesInstalled && !V8RemoveLiveFrameProbes())
+                            {
+                                V5Trace("DXVK-LIVE: scanner found device but startup probe removal failed");
+                                return 0;
+                            }
+                            const bool ok = AttachExistingD3D9Device(candidate);
+                            LogCategory("DXVK", "HOTFIX-DIAG D04 AttachExistingD3D9Device returned=%s candidate=%p", ok ? "TRUE" : "FALSE", candidate);
+                            V5Trace("DXVK-V11: AttachExistingD3D9Device=%s object=%p",
+                                ok ? "TRUE" : "FALSE", candidate);
+
+                            if (ok)
+                            {
+                                g_v6DeviceAttached.store(true, std::memory_order_release);
+                                if (IDirect3DDevice9* extra = g_v8CapturedDevice.exchange(
+                                        nullptr, std::memory_order_acq_rel))
+                                    extra->Release();
+                                V5Trace("DXVK-V11: VERIFIED LIVE DXVK DEVICE ATTACHED WITH CORE INIT");
+                                return 0;
+                            }
                         }
                     }
+                    __except (EXCEPTION_EXECUTE_HANDLER)
+                    {
+                        const DWORD sehCode = GetExceptionCode();
+                        LogCategory("DXVK", "HOTFIX-DIAG D90 scanner SEH caught code=0x%08lX region=%p; continuing", sehCode, mbi.BaseAddress);
+                        // Region changed while scanning OR attachment faulted; continue with next region.
+                    }
                 }
-                __except (EXCEPTION_EXECUTE_HANDLER)
-                {
-                    const DWORD sehCode = GetExceptionCode();
-                    LogCategory("DXVK", "HOTFIX-DIAG D90 scanner SEH caught code=0x%08lX region=%p; continuing", sehCode, mbi.BaseAddress);
-                    // Region changed while scanning OR attachment faulted; continue with next region.
-                }
+                addr = next;
             }
-            addr = next;
+
+            if (!g_v6DeviceAttached.load(std::memory_order_acquire))
+                V5Trace("DXVK-V8: discovery pass %u/%u found no verified device (regions=%llu words=%llu)",
+                    pass, kMaxDiscoveryPasses,
+                    static_cast<unsigned long long>(regions),
+                    static_cast<unsigned long long>(words));
         }
 
-        V5Trace("DXVK-V8: discovery finished without verified attachment regions=%llu words=%llu",
-            static_cast<unsigned long long>(regions),
-            static_cast<unsigned long long>(words));
+        // Late-loading scenes can render after all bounded heap scans. Keep
+        // checking *only* the captured callback pointer, no more heap walks.
+        if (liveProbesInstalled && !g_v6DeviceAttached.load(std::memory_order_acquire))
+        {
+            V5Trace("DXVK-LIVE: heap discovery exhausted; method calls so far=%u; waiting for first real frame",
+                g_v8ProbeCallCount.load(std::memory_order_relaxed));
+            for (unsigned attempt = 0; attempt < 200 &&
+                 !g_v6DeviceAttached.load(std::memory_order_acquire); ++attempt)
+            {
+                IDirect3DDevice9* live =
+                    g_v8CapturedDevice.exchange(nullptr, std::memory_order_acq_rel);
+                if (!live)
+                {
+                    Sleep(100);
+                    continue;
+                }
+                const bool valid = V8VerifyLiveD3D9Device(live);
+                if (valid && V8RemoveLiveFrameProbes())
+                {
+                    const bool attached = AttachExistingD3D9Device(live);
+                    live->Release();
+                    if (attached)
+                    {
+                        g_v6DeviceAttached.store(true, std::memory_order_release);
+                        V5Trace("DXVK-LIVE: late live device ATTACHED via render callback");
+                    }
+                    else
+                        V5Trace("DXVK-LIVE: late live device verified, core attachment FAILED");
+                    break;
+                }
+                live->Release();
+            }
+        }
+        V5Trace("DXVK-V8: discovery finished attached=%d live-probe-calls=%u",
+            g_v6DeviceAttached.load(std::memory_order_acquire) ? 1 : 0,
+            g_v8ProbeCallCount.load(std::memory_order_relaxed));
+        if (liveProbesInstalled)
+            V8RemoveLiveFrameProbes();
         return 0;
     }
 }

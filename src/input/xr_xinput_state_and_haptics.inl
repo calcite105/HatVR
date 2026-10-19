@@ -14,6 +14,15 @@
     static XrAction g_actionRightTrigger = XR_NULL_HANDLE;
     static XrAction g_actionLeftGrip = XR_NULL_HANDLE;
     static XrAction g_actionRightGrip = XR_NULL_HANDLE;
+    // Index: the grip's closing amount is not a deliberate squeeze.
+    // Track FORCE independently, so resting fingers never press L1/R1.
+    static XrAction g_actionIndexLeftGripForce = XR_NULL_HANDLE;
+    static XrAction g_actionIndexRightGripForce = XR_NULL_HANDLE;
+    // Vive wand grips are binary; Frame has independent physical bumpers.
+    static XrAction g_actionViveLeftGripClick = XR_NULL_HANDLE;
+    static XrAction g_actionViveRightGripClick = XR_NULL_HANDLE;
+    static XrAction g_actionLeftBumper = XR_NULL_HANDLE;
+    static XrAction g_actionRightBumper = XR_NULL_HANDLE;
     static XrAction g_actionStart = XR_NULL_HANDLE;
     static XrAction g_actionBack = XR_NULL_HANDLE;
     static XrAction g_actionLeftStickClick = XR_NULL_HANDLE;

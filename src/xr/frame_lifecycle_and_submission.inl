@@ -479,6 +479,24 @@
         if (v82CopyHeight == 0)   v82DropMask |= 0x100;
         if (!v82SwapReady)        v82DropMask |= 0x200;
 
+        // Standard Stereo must present a NEW SBS pair with a verified pose.
+        // Recommended and legacy sequential retain their existing behavior.
+        const bool v82StandardStereo = !g_newSequentialStereoEnabled &&
+            !g_nativeStereoEnabled && g_v138SameTickAfrActive;
+        if (v82StandardStereo)
+        {
+            const unsigned long long pixelPose = (unsigned long long)
+                InterlockedCompareExchange64(&g_capturedStereoPoseSerial, 0, 0);
+            const RenderPoseHistorySlot& history =
+                g_renderPoseHistory[pixelPose & 63ULL];
+            const ULONGLONG now = GetTickCount64();
+            if (!v80NewPair) v82DropMask |= 0x400;
+            if (pixelPose == 0 || history.serial != pixelPose ||
+                history.capturedAtMs == 0 || now < history.capturedAtMs ||
+                now - history.capturedAtMs > 250ULL)
+                v82DropMask |= 0x800;
+        }
+
         const bool v82SubmitPredicatesOk = (v82DropMask == 0);
 
         if (v82SubmitPredicatesOk)
@@ -1137,7 +1155,11 @@ static float* HookedPerspectiveMatrixCandidate(
         if (!device || !g_xrRuntimeEyeWidth || !g_xrRuntimeEyeHeight)
             return false;
 
-        const UINT wantedW = g_xrRuntimeEyeWidth * 2u;
+        // NewSequentialStereo's completed eye renderers are captured independently.  Its
+        // world RT must be one eye wide, not a leftover double-width SBS RT.
+        // Stereo and regular Sequential retain their original SBS allocation.
+        const UINT wantedW = g_xrRuntimeEyeWidth *
+            (g_newSequentialStereoEnabled ? 1u : 2u);
         const UINT wantedH = g_xrRuntimeEyeHeight;
         if (g_nativeVrColorSurface && g_nativeVrDepthSurface &&
             g_nativeVrWidth == wantedW && g_nativeVrHeight == wantedH)
@@ -1199,8 +1221,9 @@ static float* HookedPerspectiveMatrixCandidate(
         g_nativeVrWidth = wantedW;
         g_nativeVrHeight = wantedH;
         char line[256] = {};
-        sprintf_s(line, sizeof(line), "NATIVE VR TARGET CREATED: %ux%u SBS (%ux%u per eye)\n",
-            wantedW, wantedH, g_xrRuntimeEyeWidth, g_xrRuntimeEyeHeight);
+        sprintf_s(line, sizeof(line), "NATIVE VR TARGET CREATED: %ux%u %s (%ux%u per eye)\n",
+            wantedW, wantedH, g_newSequentialStereoEnabled ? "NEW_SEQUENTIAL_STEREO EYE" : "SBS",
+            g_xrRuntimeEyeWidth, g_xrRuntimeEyeHeight);
         DebugLog(line);
         return true;
     }
@@ -1210,7 +1233,8 @@ static float* HookedPerspectiveMatrixCandidate(
         if (g_nativeVrResolutionEnabled && g_xrRuntimeEyeWidth &&
             g_gameplayViewportResourceHandle && viewport &&
             *reinterpret_cast<unsigned long long*>(static_cast<unsigned char*>(viewport) + 8) == g_gameplayViewportResourceHandle)
-            return g_xrRuntimeEyeWidth * 2u;
+            return g_xrRuntimeEyeWidth *
+                (g_newSequentialStereoEnabled ? 1u : 2u);
         return g_originalViewportGetSizeX ? g_originalViewportGetSizeX(viewport) : 0;
     }
 
@@ -1219,7 +1243,16 @@ static float* HookedPerspectiveMatrixCandidate(
         if (g_nativeVrResolutionEnabled && g_xrRuntimeEyeHeight &&
             g_gameplayViewportResourceHandle && viewport &&
             *reinterpret_cast<unsigned long long*>(static_cast<unsigned char*>(viewport) + 8) == g_gameplayViewportResourceHandle)
+        {
+            // V3: FViewport::GetSizeY is shared by world rendering, renderer
+            // setup and UI. Never report the UI-only 16:9 cropped height here,
+            // even while the HUD window is armed: unrelated viewport queries
+            // can occur inside that window and inherit a false world aspect.
+            // Crop handling remains solely in the Canvas finalization and
+            // UI-only Vulkan staging source rectangle. No scene-view or
+            // native depth/render-target dimension is modified.
             return g_xrRuntimeEyeHeight;
+        }
         return g_originalViewportGetSizeY ? g_originalViewportGetSizeY(viewport) : 0;
     }
 
@@ -1358,6 +1391,12 @@ static float* HookedPerspectiveMatrixCandidate(
 
             if (g_v26SequentialReentry && g_v26InsideDraw)
                 g_v26SawGameplayCalc = true;
+            // The high-level Draw hook's `self` is NOT a UObject in this build.
+            // The actual gameplay CalcSceneView argument IS a ULocalPlayer;
+            // observe it for safely resolving UEngine and its mirror flag.
+            VrMirrorObserveLocalPlayer(localPlayer);
+            if (g_newSequentialStereoEnabled && g_v26InsideDraw)
+                g_newSequentialStereoLocalPlayer = static_cast<unsigned char*>(localPlayer);
             static unsigned v16GameplayCalcLogs = 0;
             const bool v16TraceCalc = (v16GameplayCalcLogs++ < 12);
             if (v16TraceCalc)
@@ -1465,13 +1504,55 @@ static float* HookedPerspectiveMatrixCandidate(
             const float ox=*originX, oy=*originY, sx=*sizeX, sy=*sizeY;
             const bool right = g_v26SecondPass;
             g_renderRightEye = right;
-            *originX = right ? ox + sx*0.5f : ox;
-            *originY = oy;
-            *sizeX = sx * 0.5f;
-            *sizeY = sy;
+            if (g_newSequentialStereoEnabled) g_calcSceneRightEye = right;
+
+            // Full-frame NewSequentialStereo: keep the normal single-player logical viewport
+            // and retain each completed eye separately. Half-width LocalPlayer
+            // viewport data belongs exclusively to the legacy fallback.
+            static int newSequentialStereoSceneRectSetting = -1;
+            if (newSequentialStereoSceneRectSetting < 0)
+            {
+                newSequentialStereoSceneRectSetting = GetPrivateProfileIntA(
+                    "HatVR", "NewSequentialStereoSceneRectTest", 1, g_hatVrConfigPath) ? 1 : 0;
+                DxvkPathTrace("NEW_SEQUENTIAL_STEREO_FULLSCREEN_VIEW config=%d (1=full logical view + independent eye capture; 0=legacy half-view)",
+                    newSequentialStereoSceneRectSetting);
+            }
+            const bool useSceneRect = g_newSequentialStereoEnabled && newSequentialStereoSceneRectSetting == 1;
+            if (!useSceneRect)
+            {
+                *originX = right ? ox + sx*0.5f : ox;
+                *originY = oy;
+                *sizeX = sx * 0.5f;
+                *sizeY = sy;
+            }
+
+            uintptr_t* playerState = reinterpret_cast<uintptr_t*>(lp + 0xF0);
+            const uintptr_t savedState = *playerState;
+            const uintptr_t rightState = (g_newSequentialStereoEnabled && right)
+                ? V51GetOrCreateRightViewState() : 0;
+            if (rightState) *playerState = rightState;
             result = g_originalCalcSceneViewCandidate(
                 localPlayer, viewFamily, viewLocation, viewRotation, viewport, viewDrawer);
+            *playerState = savedState;
             *originX=ox; *originY=oy; *sizeX=sx; *sizeY=sy;
+
+            // Full-frame NewSequentialStereo does not patch completed FSceneView geometry or
+            // D3D raster viewports. Per-eye capture occurs after scene execute.
+            if (g_newSequentialStereoEnabled && result)
+            {
+                static unsigned int stateLogs=0;
+                if (stateLogs++ < 24)
+                {
+                    uintptr_t engineState = 0;
+                    __try { engineState = *reinterpret_cast<uintptr_t*>(static_cast<uintptr_t>(result)+0x08); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    DxvkPathTrace("NEW_SEQUENTIAL_STEREO-TEST eye=%s view=%p engineViewState=%p expected=%p",
+                        right?"RIGHT":"LEFT", reinterpret_cast<void*>(static_cast<uintptr_t>(result)),
+                        reinterpret_cast<void*>(engineState),
+                        reinterpret_cast<void*>(right?rightState:savedState));
+                }
+            }
+            if (g_newSequentialStereoEnabled) g_calcSceneRightEye = false;
 
             static unsigned int v26CalcLogs=0;
             if (v26CalcLogs++ < 24)
@@ -1609,13 +1690,23 @@ static float* HookedPerspectiveMatrixCandidate(
                 g_renderRightEye = false;
                 *originX = ox;
                 *originY = oy;
-                *sizeX = sx * 0.5f;
+                *sizeX = (g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw)
+                    ? sx : sx * 0.5f;
                 *sizeY = sy;
                 result = g_originalCalcSceneViewCandidate(
                     localPlayer, viewFamily, viewLocation, viewRotation, viewport, viewDrawer);
                 if (result)
                     g_v151GenuineLeftView =
                         reinterpret_cast<void*>(static_cast<uintptr_t>(result));
+                // The high-level Draw continues after our synthetic RIGHT view.
+                // In the optional hybrid it must observe LEFT's camera outputs.
+                FVectorUE3 hybridLeftLocation{};
+                FRotatorUE3 hybridLeftRotation{};
+                if (g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw)
+                {
+                    if (viewLocation) hybridLeftLocation = *viewLocation;
+                    if (viewRotation) hybridLeftRotation = *viewRotation;
+                }
 
                 // Genuine RIGHT: run AHiT's CalcSceneView again so every engine
                 // side effect associated with creating a RIGHT view happens
@@ -1627,9 +1718,13 @@ static float* HookedPerspectiveMatrixCandidate(
                 if (rightState) *lpViewState = rightState;
 
                 g_renderRightEye = true;
-                *originX = ox + sx * 0.5f;
+                if (g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw)
+                    g_calcSceneRightEye = true;
+                *originX = (g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw)
+                    ? ox : ox + sx * 0.5f;
                 *originY = oy;
-                *sizeX = sx * 0.5f;
+                *sizeX = (g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw)
+                    ? sx : sx * 0.5f;
                 *sizeY = sy;
 
                 const unsigned long long genuineRight =
@@ -1637,7 +1732,8 @@ static float* HookedPerspectiveMatrixCandidate(
                         localPlayer, viewFamily, viewLocation, viewRotation, viewport, viewDrawer);
 
                 // before 0x81C9C0 creates the completed RIGHT FViewInfo.
-                if (genuineRight && g_v151GenuineLeftView)
+                if (genuineRight && g_v151GenuineLeftView &&
+                    !(g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw))
                 {
                     __try
                     {
@@ -1677,6 +1773,12 @@ static float* HookedPerspectiveMatrixCandidate(
                 }
 
                 *lpViewState = savedViewState;
+                if (g_newSequentialStereoEnabled && g_newSequentialStereoHybridOneDraw)
+                {
+                    g_calcSceneRightEye = false;
+                    if (viewLocation) *viewLocation = hybridLeftLocation;
+                    if (viewRotation) *viewRotation = hybridLeftRotation;
+                }
                 *originX=ox; *originY=oy; *sizeX=sx; *sizeY=sy;
 
                 // CalcSceneView appends RIGHT to the family. Preserve the pointer

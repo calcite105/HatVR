@@ -220,7 +220,7 @@ static bool g_afrRetainedUiValid = false;
     {
         static unsigned long long v7PresentCalls = 0;
         ++v7PresentCalls;
-        if (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0)
+        if (g_debugToolsEnabled && (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0))
         {
             DxvkPathTrace("V12 PRESENT ENTER call=%llu device=%p frame=%llu frameBegun=%d running=%d",
                 v7PresentCalls, self, (unsigned long long)g_presentFrameNumber,
@@ -229,10 +229,10 @@ static bool g_afrRetainedUiValid = false;
             DxvkPathTrace("V12 DEVICE TestCooperativeLevel call=%llu hr=0x%08X",
                 v7PresentCalls, (unsigned)coop);
         }
-        if (v7PresentCalls <= 5 || (v7PresentCalls % 300ULL) == 0)
+        if (g_debugToolsEnabled && (v7PresentCalls <= 5 || (v7PresentCalls % 300ULL) == 0))
             DxvkPathTrace("V9 HookedPresent HIT call=%llu device=%p xrInitialized=%d xrSession=%p",
                 v7PresentCalls, self, g_xrInitialized ? 1 : 0, g_xrSession);
-        if (v7PresentCalls <= 5 || (v7PresentCalls % 300ULL) == 0)
+        if (g_debugToolsEnabled && (v7PresentCalls <= 5 || (v7PresentCalls % 300ULL) == 0))
         {
             char v7line[384] = {};
             sprintf_s(v7line, sizeof(v7line),
@@ -241,7 +241,8 @@ static bool g_afrRetainedUiValid = false;
             DebugLog(v7line);
         }
 
-        const bool v13FineTrace = (v7PresentCalls <= 20 || (v7PresentCalls % 30ULL) == 0);
+        const bool v13FineTrace = g_debugToolsEnabled &&
+            (v7PresentCalls <= 20 || (v7PresentCalls % 30ULL) == 0);
         const unsigned long long completedFrame = g_presentFrameNumber;
 ++g_presentFrameNumber;
         static bool loggedPresent = false;
@@ -257,7 +258,7 @@ static bool g_afrRetainedUiValid = false;
         if (g_debugToolsEnabled) UpdateUiCandidateSelectorInput();
 
         static unsigned int timingLogs = 0;
-        if (g_xrFrameBegun && g_xrLocateQpcValid && timingLogs < 30)
+        if (g_debugToolsEnabled && g_xrFrameBegun && g_xrLocateQpcValid && timingLogs < 30)
         {
             LARGE_INTEGER now{}, freq{};
             QueryPerformanceCounter(&now);
@@ -303,7 +304,7 @@ static bool g_afrRetainedUiValid = false;
 
         // the retained left/right UE3 renders now exist. Copy them through
         // D3D9On12 into OpenXR swapchain images and submit a projection layer.
-        if (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0 || v7PresentCalls >= 840)
+        if (g_debugToolsEnabled && (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0))
             DxvkPathTrace("V13 PRESENT stage=J before SubmitOpenXRGameEyes call=%llu", v7PresentCalls);
         IDirect3DTexture9* spectatorUiForDesktop = nullptr;
         if (IsVulkanBackendActive())
@@ -325,6 +326,19 @@ static bool g_afrRetainedUiValid = false;
                 vkOwnedValid ? g_rendererBoundViews :
                 (vkHistoryValid ? vkHistory.views :
                     (g_renderPoseSnapshotValid ? g_renderPoseSnapshotViews : g_xrViews));
+
+            // Legacy modes have not yet been given the new renderer's strict
+            // two-eye producer matching. Capture an actionable, rare warning
+            // when neither a renderer-bound nor a historical pixel pose exists.
+            // Do not silently claim an old-mode pose problem is fixed.
+            if (!g_newSequentialStereoEnabled && vkPixelPose != 0 &&
+                !vkOwnedValid && !vkHistoryValid)
+            {
+                static unsigned int poseFallbackWarnings = 0;
+                if (poseFallbackWarnings++ < 4 || (poseFallbackWarnings % 600u) == 0u)
+                    LogCategory("XR", "Legacy renderer used non-matching submit pose: pixel=%llu bound=%llu",
+                        vkPixelPose, vkOwnedPose);
+            }
 
             IDirect3DTexture9* uiForSubmit =
                 g_uiExtractValid ? g_uiFinalTexture : nullptr;
@@ -362,10 +376,34 @@ static bool g_afrRetainedUiValid = false;
 
             spectatorUiForDesktop = uiForSubmit;
 
+            // Recommended and Standard Stereo both retain D3D9 eye textures
+            // across Presents. A retained texture is NOT a newly rendered
+            // frame: reuse the last released OpenXR pair and its original
+            // poses instead of copying stale pixels with the current pose.
+            // Standard's fresh bit is set only after a producer/pose-validated
+            // SBS render has successfully copied BOTH eyes.
+            const bool standardStereoMode =
+                g_nativeStereoEnabled && !g_newSequentialStereoEnabled;
+            const bool trackedSameTickPair = standardStereoMode ||
+                (g_newSequentialStereoEnabled && g_v138SameTickAfrActive);
+            const bool validPixelPose = vkOwnedValid || vkHistoryValid;
+            const bool newSequentialStereoReusePreviousEyes = trackedSameTickPair &&
+                (!g_newSequentialStereoNewPairThisPresent || !validPixelPose);
+            if (standardStereoMode && newSequentialStereoReusePreviousEyes)
+            {
+                static unsigned int standardReuseLogs = 0;
+                if (standardReuseLogs++ < 16 || (standardReuseLogs % 600u) == 0u)
+                    DxvkPathTrace(
+                        "STANDARD-STEREO reuse prior XR pair fresh=%d pixelPose=%llu owned=%d history=%d",
+                        g_newSequentialStereoNewPairThisPresent ? 1 : 0,
+                        vkPixelPose, vkOwnedValid ? 1 : 0,
+                        vkHistoryValid ? 1 : 0);
+            }
             const bool vkSubmitted = SubmitVulkanOpenXREyes(
                 g_leftEyeCopy, g_rightEyeCopy,
                 g_stereoCopyWidth, g_stereoCopyHeight,
                 vkSubmitViews,
+                newSequentialStereoReusePreviousEyes,
                 uiForSubmit,
                 g_theaterMode,
                 g_vrMenuOpen,
@@ -397,7 +435,7 @@ static bool g_afrRetainedUiValid = false;
 
             g_xrFrameBegun = false;
 
-            if (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0)
+            if (g_debugToolsEnabled && (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0))
                 DxvkPathTrace(
                     "VKXR-V16T PRESENT submit=%d call=%llu haveLR=%d%d size=%ux%u pixelPose=%llu owned=%d hist=%d ui=%d",
                     vkSubmitted ? 1 : 0, v7PresentCalls,
@@ -431,10 +469,10 @@ static bool g_afrRetainedUiValid = false;
         // will show; it never modifies the eye textures or OpenXR swapchains.
         DrawDesktopSpectator(self, g_spectatorView, g_spectatorUiMode, spectatorUiForDesktop);
 
-        if (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0 || v7PresentCalls >= 840)
+        if (g_debugToolsEnabled && (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0))
             DxvkPathTrace("V13 PRESENT stage=K after SubmitOpenXRGameEyes call=%llu", v7PresentCalls);
 
-        if (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0)
+        if (g_debugToolsEnabled && (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0))
             DxvkPathTrace("V12 PRESENT before downstream Present call=%llu", v7PresentCalls);
         HRESULT hr = g_originalPresent(
             self,
@@ -443,7 +481,7 @@ static bool g_afrRetainedUiValid = false;
             hDestWindowOverride,
             pDirtyRegion
         );
-        if (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0 || FAILED(hr))
+        if ((g_debugToolsEnabled && (v7PresentCalls <= 12 || (v7PresentCalls % 120ULL) == 0)) || FAILED(hr))
             DxvkPathTrace("V12 PRESENT downstream RETURN call=%llu hr=0x%08X",
                 v7PresentCalls, (unsigned)hr);
 
