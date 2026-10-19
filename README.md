@@ -58,17 +58,21 @@ Most things can be changed from inside the headset, including the renderer, firs
 
 ### Rendering
 
-HatVR has two main stereo rendering methods because neither works perfectly with everything in the game.
+HatVR has three stereo rendering methods, each with their own advantages and issues.
 
-**Stereo** is the default and uses a method based around A Hat in Time's own split-screen rendering. Most of the game works well with it, but some objects and effects can occasionally render incorrectly or disappear in the right eye.
+**Recommended** is the default renderer and has been the most visually accurate in my testing. It uses a sequential rendering approach and generally handles objects and effects that would otherwise have issues in the older rendering methods. It's still not perfect, though, and some UI elements may appear incorrectly positioned or distorted.
 
-**Synchronized Sequential** renders the eyes separately from the same game state and can fix things that don't render correctly in Stereo, including some cutscenes. It has its own tradeoffs, but if something is clearly broken in one eye, Sequential is the first thing I'd try.
+**Standard Stereo** uses a method based around A Hat in Time's own split-screen rendering. Most of the game works well with it, but some objects and effects can occasionally render incorrectly or disappear in the right eye.
+
+**Legacy Sequential** renders the eyes separately from the same game state and can fix some things that don't render correctly in Standard Stereo, including certain cutscenes. It has its own rendering issues and is generally less accurate than Recommended.
+
+Recommended is selected by default. If you encounter rendering issues, try switching between the three available renderers to see which works best. You'll need to enable **Show Other Renderers** in the VR menu to access Standard Stereo and Legacy Sequential.
 
 Ambient Occlusion can look wrong on some headsets. If that happens, turn **Ambient Occlusion off**.
 
 ### Performance and Upscaling
 
-A Hat in Time isn't normally a very demanding game, but its rendering pipeline wasn't built around stereo rendering, and VR also asks for higher resolutions and framerates than the game would normally run at. Performance will depend on the level, headset resolution, refresh rate and hardware. If you're on a Quest, using VDXR may help performance. A cheaper stereo mode will be looked into in the future, but expect it to be the least accurate if it's added.
+A Hat in Time isn't normally a very demanding game, but its rendering pipeline wasn't built around stereo rendering, and VR also asks for higher resolutions and framerates than the game would normally run at. Performance will depend on the level, headset resolution, refresh rate and hardware. If you're on a Quest, using VDXR may help performance.
 
 HatVR includes **NVIDIA Image Scaling (NIS)** and **AMD FidelityFX Super Resolution 1 (FSR 1)**. These upscale the finished game image before it's sent to OpenXR, so you can run A Hat in Time at a lower resolution while using a larger VR output. For example, +100% Output Upscale can turn a 1440p game image into a 2880p OpenXR output without changing the resolution the game itself renders at.
 
@@ -98,14 +102,15 @@ HatVR has optional PSVR2-specific features through **PSVR2 Toolkit**, including 
 
 * The HatVR menu currently needs to be opened with a normal controller or VR controller. There isn't a keyboard or mouse shortcut for it yet.
 * Mouse input doesn't work very well in VR since it doesn't compensate for the much larger UI resolution.
-* Some objects and effects can render incorrectly or disappear in one eye in Stereo. Try Sequential when this happens.
-* Some cutscenes can have one-eye rendering problems in Stereo, and Sequential can help with some of them.
-* Ambient Occlusion can look wrong in Stereo on some headsets. Turning it off is currently the best workaround.
+* Some UI elements and button prompts may appear incorrectly positioned or distorted in Recommended.
+* Some objects, effects, and cutscenes may not render correctly in VR. If you encounter rendering issues, try switching between the three available renderers to see which works best.
+* Ambient Occlusion can look wrong on some headsets. Turning it off is currently the best workaround.
 * Some scripted cameras and cutscenes can still behave strangely in VR.
 * First Person and the VR avatar are experimental, especially with different or modded player models. Your fingers may randomly distort then quickly go back to normal for example.
 * Looking around freely can occasionally reveal things the original camera wasn't meant to show.
 
 If you run into something that isn't covered here, feel free to report it.
+
 
 ## Credits
 
