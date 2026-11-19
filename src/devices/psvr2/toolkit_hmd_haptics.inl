@@ -495,15 +495,17 @@
         FP_V123FindRawNameIndex("SetCamShakeScale", g_hnSetCamShakeScale);
         FP_V123FindRawNameIndex("ReinitShake", g_hnReinitShake);
 
-        auto* exe = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
-        if (!exe)
-            return;
-
         // HatinTimeGame.exe 2026-09-25:
         // UObject::ProcessInternal = 0x1400E2330 (RVA 0xE2860).
         // The signature is confirmed by the EX_Return (0x04) bytecode loop and
         // GNatives dispatch table at 0x141148C50.
-        void* target = exe + 0xE2860;
+        // that's the reference build, it's found per game build by signature now.
+        void* target = GameAddrAs<void*>(GA_ProcessInternal);
+        if (!target)
+        {
+            LogCategory("PSVR2", "UObject::ProcessInternal not found in this game build; HMD haptics disabled");
+            return;
+        }
         MH_STATUS st = MH_CreateHook(
             target,
             reinterpret_cast<void*>(&HatVrHookedProcessInternal),

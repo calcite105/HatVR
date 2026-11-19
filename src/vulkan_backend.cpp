@@ -217,8 +217,44 @@ namespace ahitvr
         uint32_t g_phase81UiStagingHeight = 0;
 
         VkCommandPool g_vkCommandPool = VK_NULL_HANDLE;
-        VkCommandBuffer g_vkCommandBuffer = VK_NULL_HANDLE;
+        VkCommandBuffer g_vkCommandBuffer = VK_NULL_HANDLE; // only for one off synchronous uploads
         VkFence g_vkFence = VK_NULL_HANDLE;
+
+        // openxr queue submit resources for each bridge slot (0 = left eye, 1 = right eye,
+        // 2 = ahit ui). each slot has its own command buffer and fence so a
+        // frame's copies only get submitted, the cpu never waits on them. openxr needs the
+        // work to be submitted to the session queue before xrReleaseSwapchainImage,
+        // it doesn't need to be finished. a slot's fence is only waited on when that slot is reused
+        // next frame (or before destroying stuff it might still be using).
+        struct BridgeXrSubmit
+        {
+            VkCommandBuffer cb = VK_NULL_HANDLE;
+            VkFence fence = VK_NULL_HANDLE;
+            bool pending = false; // fence was submitted and I haven't seen it finish yet
+        };
+        BridgeXrSubmit g_bridgeXrSubmit[3] = {};
+
+        // has a limit so a stuck bridge copy shows up in the log instead of just
+        // hanging. a normal copy finishes within a frame, 5s means the gpu work
+        // is never going to finish (device lost / cross device semaphore stuck).
+        constexpr uint64_t kBridgeFenceTimeoutNs = 5000000000ULL;
+
+        VkResult WaitBridgeXrSlot(int slot)
+        {
+            if (slot < 0 || slot >= 3) return VK_SUCCESS;
+            BridgeXrSubmit& s = g_bridgeXrSubmit[slot];
+            if (!s.pending || !s.fence || !g_vkDevice) return VK_SUCCESS;
+            const VkResult r = vkWaitForFences(g_vkDevice, 1, &s.fence, VK_TRUE, kBridgeFenceTimeoutNs);
+            if (r == VK_SUCCESS) s.pending = false;
+            else DxvkPathTrace("VKBRIDGE-SYNC XR slot fence wait FAILED slot=%d vk=%d (timeout=5s)", slot, (int)r);
+            return r;
+        }
+
+        void WaitAllBridgeXrSlots()
+        {
+            for (int slot = 0; slot < 3; ++slot)
+                WaitBridgeXrSlot(slot);
+        }
 
         PFN_vkDestroyInstance g_vkDestroyInstance = nullptr;
         PFN_vkDestroyDevice g_vkDestroyDevice = nullptr;
@@ -267,6 +303,8 @@ namespace ahitvr
 
         void DestroyEyeSwapchains()
         {
+            // bridge copies that are still in flight might be using these swapchain images.
+            WaitAllBridgeXrSlots();
             // A recreated/destroyed swapchain has no previous released image.
             g_vkHaveReusableEyePair = false;
             for (int eye = 0; eye < 2; ++eye)
@@ -284,7 +322,8 @@ namespace ahitvr
 
         bool EnsureCommandResources()
         {
-            if (g_vkCommandPool && g_vkCommandBuffer && g_vkFence)
+            if (g_vkCommandPool && g_vkCommandBuffer && g_vkFence &&
+                g_bridgeXrSubmit[2].cb && g_bridgeXrSubmit[2].fence)
                 return true;
 
             VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -303,6 +342,15 @@ namespace ahitvr
             VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
             if (vkCreateFence(g_vkDevice, &fci, nullptr, &g_vkFence) != VK_SUCCESS)
                 return false;
+
+            for (BridgeXrSubmit& s : g_bridgeXrSubmit)
+            {
+                if (vkAllocateCommandBuffers(g_vkDevice, &cai, &s.cb) != VK_SUCCESS)
+                    return false;
+                if (vkCreateFence(g_vkDevice, &fci, nullptr, &s.fence) != VK_SUCCESS)
+                    return false;
+                s.pending = false;
+            }
             return true;
         }
 
@@ -412,6 +460,8 @@ namespace ahitvr
 
         void DestroyUiSwapchain()
         {
+            // a ui copy/clear that's still in flight might be using these swapchain images.
+            WaitAllBridgeXrSlots();
             g_vkUiSwapchainImages.clear();
             if (g_vkUiSwapchain != XR_NULL_HANDLE)
             {
@@ -1234,13 +1284,15 @@ namespace ahitvr
             VkShaderModule shader = VK_NULL_HANDLE;
             VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
             VkDescriptorPool pool = VK_NULL_HANDLE;
-            VkDescriptorSet set = VK_NULL_HANDLE;
+            // one descriptor set + config buffer per eye, since both eyes' upscales can be
+            // in flight at once and a set/ubo can't be rewritten while it's being used.
+            VkDescriptorSet set[2] = {};
             VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
             VkPipeline pipeline = VK_NULL_HANDLE;
             VkSampler sampler = VK_NULL_HANDLE;
-            VkBuffer configBuffer = VK_NULL_HANDLE;
-            VkDeviceMemory configMemory = VK_NULL_HANDLE;
-            void* configMapped = nullptr;
+            VkBuffer configBuffer[2] = {};
+            VkDeviceMemory configMemory[2] = {};
+            void* configMapped[2] = {};
             VkImage coefScale = VK_NULL_HANDLE, coefUsm = VK_NULL_HANDLE;
             VkDeviceMemory coefScaleMem = VK_NULL_HANDLE, coefUsmMem = VK_NULL_HANDLE;
             VkImageView coefScaleView = VK_NULL_HANDLE, coefUsmView = VK_NULL_HANDLE;
@@ -1325,13 +1377,17 @@ namespace ahitvr
             binds[5]={5,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
             VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dl.bindingCount=6; dl.pBindings=binds;
             if(vkCreateDescriptorSetLayout(g_vkDevice,&dl,nullptr,&g_nis.setLayout)!=VK_SUCCESS) return fail();
-            VkDescriptorPoolSize ps[3]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,3},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1}};
-            VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dp.maxSets=1; dp.poolSizeCount=3; dp.pPoolSizes=ps;
+            VkDescriptorPoolSize ps[3]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,6},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2}};
+            VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dp.maxSets=2; dp.poolSizeCount=3; dp.pPoolSizes=ps;
             if(vkCreateDescriptorPool(g_vkDevice,&dp,nullptr,&g_nis.pool)!=VK_SUCCESS) return fail();
-            VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool=g_nis.pool; da.descriptorSetCount=1; da.pSetLayouts=&g_nis.setLayout;
-            if(vkAllocateDescriptorSets(g_vkDevice,&da,&g_nis.set)!=VK_SUCCESS) return fail();
-            if(!CreateNisBuffer(sizeof(NISConfig),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,g_nis.configBuffer,g_nis.configMemory,&g_nis.configMapped)) return fail();
-            VkDescriptorBufferInfo db{g_nis.configBuffer,0,sizeof(NISConfig)}; VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w.dstSet=g_nis.set; w.dstBinding=0; w.descriptorCount=1; w.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w.pBufferInfo=&db; vkUpdateDescriptorSets(g_vkDevice,1,&w,0,nullptr);
+            VkDescriptorSetLayout nisLayouts[2]={g_nis.setLayout,g_nis.setLayout};
+            VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool=g_nis.pool; da.descriptorSetCount=2; da.pSetLayouts=nisLayouts;
+            if(vkAllocateDescriptorSets(g_vkDevice,&da,g_nis.set)!=VK_SUCCESS) return fail();
+            for(int eye=0;eye<2;++eye)
+            {
+                if(!CreateNisBuffer(sizeof(NISConfig),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,g_nis.configBuffer[eye],g_nis.configMemory[eye],&g_nis.configMapped[eye])) return fail();
+                VkDescriptorBufferInfo db{g_nis.configBuffer[eye],0,sizeof(NISConfig)}; VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w.dstSet=g_nis.set[eye]; w.dstBinding=0; w.descriptorCount=1; w.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w.pBufferInfo=&db; vkUpdateDescriptorSets(g_vkDevice,1,&w,0,nullptr);
+            }
             VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pl.setLayoutCount=1; pl.pSetLayouts=&g_nis.setLayout;
             if(vkCreatePipelineLayout(g_vkDevice,&pl,nullptr,&g_nis.pipelineLayout)!=VK_SUCCESS) return fail();
             VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st.stage=VK_SHADER_STAGE_COMPUTE_BIT; st.module=g_nis.shader; st.pName="main";
@@ -1349,6 +1405,7 @@ namespace ahitvr
         {
             if(!EnsureNisResources()) return false;
             if(g_nis.output && g_nis.outputW==w && g_nis.outputH==h && g_nis.outputFormat==format) return true;
+            if(g_nis.output) WaitAllBridgeXrSlots(); // eye upscales still in flight might be using it
             if(g_nis.outputView) vkDestroyImageView(g_vkDevice,g_nis.outputView,nullptr); if(g_nis.output) vkDestroyImage(g_vkDevice,g_nis.output,nullptr); if(g_nis.outputMem) vkFreeMemory(g_vkDevice,g_nis.outputMem,nullptr);
             g_nis.outputView=VK_NULL_HANDLE; g_nis.output=VK_NULL_HANDLE; g_nis.outputMem=VK_NULL_HANDLE;
             if(!CreateNisImage(w,h,format,VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,g_nis.output,g_nis.outputMem)) return false;
@@ -1357,34 +1414,35 @@ namespace ahitvr
         }
 
         // Records NIS into an already-open command buffer. Caller owns source/destination layout restoration and queue synchronization.
-        // Returns a temporary source view which must be destroyed only after the submitted command buffer has completed.
-        VkImageView RecordNisUpscale(VkCommandBuffer cmd,VkImage src,VkFormat srcFormat,VkImageLayout srcLayout,
+        // eye picks the per eye descriptor set/ubo, the caller has to have waited for that eye's last submission.
+        // srcView is a view of src owned by the caller that stays alive while the submission is in flight.
+        bool RecordNisUpscale(VkCommandBuffer cmd,int eye,VkImage src,VkImageView srcView,VkImageLayout srcLayout,
             uint32_t textureW,uint32_t textureH,uint32_t originX,uint32_t originY,uint32_t srcW,uint32_t srcH,
             VkImage dst,VkImageLayout dstLayout,uint32_t dstW,uint32_t dstH)
         {
-            if(!EnsureNisOutput(dstW,dstH,(VkFormat)g_vkSwapchainFormat)) return VK_NULL_HANDLE;
-            VkImageView srcView=CreateNisView(src,srcFormat); if(!srcView) return VK_NULL_HANDLE;
-            NISConfig cfg{}; if(!NVScalerUpdateConfig(cfg,(float)g_openXrUpscaleSharpness/100.0f,originX,originY,srcW,srcH,textureW,textureH,0,0,dstW,dstH,dstW,dstH,NISHDRMode::None)){ vkDestroyImageView(g_vkDevice,srcView,nullptr); return VK_NULL_HANDLE; }
-            memcpy(g_nis.configMapped,&cfg,sizeof(cfg));
+            if(eye<0 || eye>1 || !srcView) return false;
+            if(!EnsureNisOutput(dstW,dstH,(VkFormat)g_vkSwapchainFormat)) return false;
+            NISConfig cfg{}; if(!NVScalerUpdateConfig(cfg,(float)g_openXrUpscaleSharpness/100.0f,originX,originY,srcW,srcH,textureW,textureH,0,0,dstW,dstH,dstW,dstH,NISHDRMode::None)) return false;
+            memcpy(g_nis.configMapped[eye],&cfg,sizeof(cfg));
             VkDescriptorImageInfo in{VK_NULL_HANDLE,srcView,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkDescriptorImageInfo out{VK_NULL_HANDLE,g_nis.outputView,VK_IMAGE_LAYOUT_GENERAL};
             VkDescriptorImageInfo cs{VK_NULL_HANDLE,g_nis.coefScaleView,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkDescriptorImageInfo cu{VK_NULL_HANDLE,g_nis.coefUsmView,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkWriteDescriptorSet wr[4]{}; uint32_t bindings[4]={2,3,4,5}; VkDescriptorType types[4]={VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE}; VkDescriptorImageInfo* infos[4]={&in,&out,&cs,&cu};
-            for(int i=0;i<4;++i){wr[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;wr[i].dstSet=g_nis.set;wr[i].dstBinding=bindings[i];wr[i].descriptorCount=1;wr[i].descriptorType=types[i];wr[i].pImageInfo=infos[i];} vkUpdateDescriptorSets(g_vkDevice,4,wr,0,nullptr);
+            for(int i=0;i<4;++i){wr[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;wr[i].dstSet=g_nis.set[eye];wr[i].dstBinding=bindings[i];wr[i].descriptorCount=1;wr[i].descriptorType=types[i];wr[i].pImageInfo=infos[i];} vkUpdateDescriptorSets(g_vkDevice,4,wr,0,nullptr);
             VkImageMemoryBarrier pre[3]{};
             pre[0]={VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; pre[0].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT; pre[0].dstAccessMask=VK_ACCESS_SHADER_READ_BIT; pre[0].oldLayout=srcLayout; pre[0].newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; pre[0].srcQueueFamilyIndex=pre[0].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; pre[0].image=src; pre[0].subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
             pre[1]={VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; pre[1].dstAccessMask=VK_ACCESS_SHADER_WRITE_BIT; pre[1].oldLayout=VK_IMAGE_LAYOUT_UNDEFINED; pre[1].newLayout=VK_IMAGE_LAYOUT_GENERAL; pre[1].srcQueueFamilyIndex=pre[1].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; pre[1].image=g_nis.output; pre[1].subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
             pre[2]={VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; pre[2].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT; pre[2].dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; pre[2].oldLayout=dstLayout; pre[2].newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; pre[2].srcQueueFamilyIndex=pre[2].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; pre[2].image=dst; pre[2].subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,3,pre);
-            vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_nis.pipeline); vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_nis.pipelineLayout,0,1,&g_nis.set,0,nullptr);
+            vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_nis.pipeline); vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_nis.pipelineLayout,0,1,&g_nis.set[eye],0,nullptr);
             vkCmdDispatch(cmd,(dstW+31)/32,(dstH+23)/24,1);
             VkImageMemoryBarrier post{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; post.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; post.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT; post.oldLayout=VK_IMAGE_LAYOUT_GENERAL; post.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; post.srcQueueFamilyIndex=post.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; post.image=g_nis.output; post.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&post);
             VkImageCopy c{}; c.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; c.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; c.extent={dstW,dstH,1}; vkCmdCopyImage(cmd,g_nis.output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&c);
             VkImageMemoryBarrier restore[2]={pre[0],pre[2]}; restore[0].srcAccessMask=VK_ACCESS_SHADER_READ_BIT; restore[0].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT; restore[0].oldLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; restore[0].newLayout=srcLayout; restore[1].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; restore[1].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT; restore[1].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; restore[1].newLayout=dstLayout;
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,2,restore);
-            return srcView;
+            return true;
         }
 
         // AMD FidelityFX Super Resolution 1.x (EASU + optional RCAS).
@@ -1394,13 +1452,14 @@ namespace ahitvr
             VkShaderModule easuShader=VK_NULL_HANDLE, rcasShader=VK_NULL_HANDLE;
             VkDescriptorSetLayout setLayout=VK_NULL_HANDLE;
             VkDescriptorPool pool=VK_NULL_HANDLE;
-            VkDescriptorSet easuSet=VK_NULL_HANDLE, rcasSet=VK_NULL_HANDLE;
+            // per eye sets/constants (index = eye), both eyes can be in flight at once.
+            VkDescriptorSet easuSet[2]={}, rcasSet[2]={};
             VkPipelineLayout pipelineLayout=VK_NULL_HANDLE;
             VkPipeline easuPipeline=VK_NULL_HANDLE, rcasPipeline=VK_NULL_HANDLE;
             VkSampler sampler=VK_NULL_HANDLE;
-            VkBuffer easuConstants=VK_NULL_HANDLE, rcasConstants=VK_NULL_HANDLE;
-            VkDeviceMemory easuConstantsMem=VK_NULL_HANDLE, rcasConstantsMem=VK_NULL_HANDLE;
-            void* easuMapped=nullptr; void* rcasMapped=nullptr;
+            VkBuffer easuConstants[2]={}, rcasConstants[2]={};
+            VkDeviceMemory easuConstantsMem[2]={}, rcasConstantsMem[2]={};
+            void* easuMapped[2]={}; void* rcasMapped[2]={};
             VkImage intermediate=VK_NULL_HANDLE, output=VK_NULL_HANDLE;
             VkDeviceMemory intermediateMem=VK_NULL_HANDLE, outputMem=VK_NULL_HANDLE;
             VkImageView intermediateView=VK_NULL_HANDLE, outputView=VK_NULL_HANDLE;
@@ -1434,16 +1493,19 @@ namespace ahitvr
             b[3]={3,VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,&g_fsr.sampler};
             VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dl.bindingCount=4; dl.pBindings=b;
             if(vkCreateDescriptorSetLayout(g_vkDevice,&dl,nullptr,&g_fsr.setLayout)!=VK_SUCCESS) return fail();
-            VkDescriptorPoolSize ps[3]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,2},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2}};
-            VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dp.maxSets=2; dp.poolSizeCount=3; dp.pPoolSizes=ps;
+            VkDescriptorPoolSize ps[3]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,4},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,4},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,4}};
+            VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dp.maxSets=4; dp.poolSizeCount=3; dp.pPoolSizes=ps;
             if(vkCreateDescriptorPool(g_vkDevice,&dp,nullptr,&g_fsr.pool)!=VK_SUCCESS) return fail();
-            VkDescriptorSetLayout layouts[2]={g_fsr.setLayout,g_fsr.setLayout}; VkDescriptorSet sets[2]{};
-            VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool=g_fsr.pool; da.descriptorSetCount=2; da.pSetLayouts=layouts;
-            if(vkAllocateDescriptorSets(g_vkDevice,&da,sets)!=VK_SUCCESS) return fail(); g_fsr.easuSet=sets[0]; g_fsr.rcasSet=sets[1];
-            if(!CreateNisBuffer(sizeof(HatVrFsrConstants),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,g_fsr.easuConstants,g_fsr.easuConstantsMem,&g_fsr.easuMapped) ||
-               !CreateNisBuffer(sizeof(HatVrFsrConstants),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,g_fsr.rcasConstants,g_fsr.rcasConstantsMem,&g_fsr.rcasMapped)) return fail();
-            VkDescriptorBufferInfo db[2]={{g_fsr.easuConstants,0,sizeof(HatVrFsrConstants)},{g_fsr.rcasConstants,0,sizeof(HatVrFsrConstants)}};
-            VkWriteDescriptorSet wb[2]{}; for(int i=0;i<2;++i){wb[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;wb[i].dstSet=i?g_fsr.rcasSet:g_fsr.easuSet;wb[i].dstBinding=0;wb[i].descriptorCount=1;wb[i].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;wb[i].pBufferInfo=&db[i];} vkUpdateDescriptorSets(g_vkDevice,2,wb,0,nullptr);
+            for(int eye=0;eye<2;++eye)
+            {
+                VkDescriptorSetLayout layouts[2]={g_fsr.setLayout,g_fsr.setLayout}; VkDescriptorSet sets[2]{};
+                VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool=g_fsr.pool; da.descriptorSetCount=2; da.pSetLayouts=layouts;
+                if(vkAllocateDescriptorSets(g_vkDevice,&da,sets)!=VK_SUCCESS) return fail(); g_fsr.easuSet[eye]=sets[0]; g_fsr.rcasSet[eye]=sets[1];
+                if(!CreateNisBuffer(sizeof(HatVrFsrConstants),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,g_fsr.easuConstants[eye],g_fsr.easuConstantsMem[eye],&g_fsr.easuMapped[eye]) ||
+                   !CreateNisBuffer(sizeof(HatVrFsrConstants),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,g_fsr.rcasConstants[eye],g_fsr.rcasConstantsMem[eye],&g_fsr.rcasMapped[eye])) return fail();
+                VkDescriptorBufferInfo db[2]={{g_fsr.easuConstants[eye],0,sizeof(HatVrFsrConstants)},{g_fsr.rcasConstants[eye],0,sizeof(HatVrFsrConstants)}};
+                VkWriteDescriptorSet wb[2]{}; for(int i=0;i<2;++i){wb[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;wb[i].dstSet=i?g_fsr.rcasSet[eye]:g_fsr.easuSet[eye];wb[i].dstBinding=0;wb[i].descriptorCount=1;wb[i].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;wb[i].pBufferInfo=&db[i];} vkUpdateDescriptorSets(g_vkDevice,2,wb,0,nullptr);
+            }
             VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pl.setLayoutCount=1; pl.pSetLayouts=&g_fsr.setLayout; if(vkCreatePipelineLayout(g_vkDevice,&pl,nullptr,&g_fsr.pipelineLayout)!=VK_SUCCESS) return fail();
             auto makePipe=[&](VkShaderModule shader,VkPipeline& pipe){VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};st.stage=VK_SHADER_STAGE_COMPUTE_BIT;st.module=shader;st.pName="main";VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};cp.stage=st;cp.layout=g_fsr.pipelineLayout;return vkCreateComputePipelines(g_vkDevice,VK_NULL_HANDLE,1,&cp,nullptr,&pipe)==VK_SUCCESS;};
             if(!makePipe(g_fsr.easuShader,g_fsr.easuPipeline)||!makePipe(g_fsr.rcasShader,g_fsr.rcasPipeline)) return fail();
@@ -1454,6 +1516,7 @@ namespace ahitvr
         {
             if(!EnsureFsrResources()) return false;
             if(g_fsr.output && g_fsr.outputW==w && g_fsr.outputH==h) return true;
+            if(g_fsr.output) WaitAllBridgeXrSlots(); // eye upscales still in flight might be using it
             auto kill=[&](VkImageView& v,VkImage& i,VkDeviceMemory& m){if(v)vkDestroyImageView(g_vkDevice,v,nullptr);if(i)vkDestroyImage(g_vkDevice,i,nullptr);if(m)vkFreeMemory(g_vkDevice,m,nullptr);v=VK_NULL_HANDLE;i=VK_NULL_HANDLE;m=VK_NULL_HANDLE;};
             kill(g_fsr.intermediateView,g_fsr.intermediate,g_fsr.intermediateMem); kill(g_fsr.outputView,g_fsr.output,g_fsr.outputMem);
             const VkImageUsageFlags usage=VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -1462,23 +1525,24 @@ namespace ahitvr
             if(!g_fsr.intermediateView||!g_fsr.outputView) return false; g_fsr.outputW=w;g_fsr.outputH=h;return true;
         }
 
-        VkImageView RecordFsrUpscale(VkCommandBuffer cmd,VkImage src,VkFormat srcFormat,VkImageLayout srcLayout,
+        // works the same way as RecordNisUpscale: per eye sets/constants, srcView owned by the caller.
+        bool RecordFsrUpscale(VkCommandBuffer cmd,int eye,VkImage src,VkImageView srcView,VkImageLayout srcLayout,
             uint32_t textureW,uint32_t textureH,uint32_t originX,uint32_t originY,uint32_t srcW,uint32_t srcH,
             VkImage dst,VkImageLayout dstLayout,uint32_t dstW,uint32_t dstH)
         {
-            if(!EnsureFsrOutput(dstW,dstH)) return VK_NULL_HANDLE;
-            VkImageView srcView=CreateNisView(src,srcFormat); if(!srcView) return VK_NULL_HANDLE;
+            if(eye<0 || eye>1 || !srcView) return false;
+            if(!EnsureFsrOutput(dstW,dstH)) return false;
             HatVrFsrConstants easu{}; FsrEasuConOffset(easu.Const0,easu.Const1,easu.Const2,easu.Const3,(AF1)srcW,(AF1)srcH,(AF1)textureW,(AF1)textureH,(AF1)dstW,(AF1)dstH,(AF1)originX,(AF1)originY);
             const bool xrTargetIsSrgb = ((VkFormat)g_vkSwapchainFormat == VK_FORMAT_B8G8R8A8_SRGB || (VkFormat)g_vkSwapchainFormat == VK_FORMAT_R8G8B8A8_SRGB);
             const bool useRcas=g_openXrUpscaleSharpness>0;
             // Sample.x is a HatVR extension to AMD's sample shader: only the final FSR pass
             // decodes the display-curve result to linear before Vulkan blits into an sRGB XR image.
             // r247d's embedded shaders use the exact inverse-sRGB transfer function here.
-            easu.Sample[0]=(xrTargetIsSrgb && !useRcas) ? 1u : 0u; memcpy(g_fsr.easuMapped,&easu,sizeof(easu));
-            HatVrFsrConstants rcas{}; if(useRcas){const float stops=2.0f*(1.0f-(float)g_openXrUpscaleSharpness/100.0f);FsrRcasCon(rcas.Const0,(AF1)stops);rcas.Sample[0]=xrTargetIsSrgb ? 1u : 0u;memcpy(g_fsr.rcasMapped,&rcas,sizeof(rcas));}
+            easu.Sample[0]=(xrTargetIsSrgb && !useRcas) ? 1u : 0u; memcpy(g_fsr.easuMapped[eye],&easu,sizeof(easu));
+            HatVrFsrConstants rcas{}; if(useRcas){const float stops=2.0f*(1.0f-(float)g_openXrUpscaleSharpness/100.0f);FsrRcasCon(rcas.Const0,(AF1)stops);rcas.Sample[0]=xrTargetIsSrgb ? 1u : 0u;memcpy(g_fsr.rcasMapped[eye],&rcas,sizeof(rcas));}
             VkDescriptorImageInfo ein{VK_NULL_HANDLE,srcView,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}; VkDescriptorImageInfo eout{VK_NULL_HANDLE,useRcas?g_fsr.intermediateView:g_fsr.outputView,VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet ew[2]{}; for(int i=0;i<2;++i) ew[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; ew[0].dstSet=g_fsr.easuSet;ew[0].dstBinding=1;ew[0].descriptorCount=1;ew[0].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;ew[0].pImageInfo=&ein; ew[1].dstSet=g_fsr.easuSet;ew[1].dstBinding=2;ew[1].descriptorCount=1;ew[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;ew[1].pImageInfo=&eout; vkUpdateDescriptorSets(g_vkDevice,2,ew,0,nullptr);
-            if(useRcas){VkDescriptorImageInfo rin{VK_NULL_HANDLE,g_fsr.intermediateView,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};VkDescriptorImageInfo rout{VK_NULL_HANDLE,g_fsr.outputView,VK_IMAGE_LAYOUT_GENERAL};VkWriteDescriptorSet rw[2]{};for(int i=0;i<2;++i)rw[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;rw[0].dstSet=g_fsr.rcasSet;rw[0].dstBinding=1;rw[0].descriptorCount=1;rw[0].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;rw[0].pImageInfo=&rin;rw[1].dstSet=g_fsr.rcasSet;rw[1].dstBinding=2;rw[1].descriptorCount=1;rw[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;rw[1].pImageInfo=&rout;vkUpdateDescriptorSets(g_vkDevice,2,rw,0,nullptr);}
+            VkWriteDescriptorSet ew[2]{}; for(int i=0;i<2;++i) ew[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; ew[0].dstSet=g_fsr.easuSet[eye];ew[0].dstBinding=1;ew[0].descriptorCount=1;ew[0].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;ew[0].pImageInfo=&ein; ew[1].dstSet=g_fsr.easuSet[eye];ew[1].dstBinding=2;ew[1].descriptorCount=1;ew[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;ew[1].pImageInfo=&eout; vkUpdateDescriptorSets(g_vkDevice,2,ew,0,nullptr);
+            if(useRcas){VkDescriptorImageInfo rin{VK_NULL_HANDLE,g_fsr.intermediateView,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};VkDescriptorImageInfo rout{VK_NULL_HANDLE,g_fsr.outputView,VK_IMAGE_LAYOUT_GENERAL};VkWriteDescriptorSet rw[2]{};for(int i=0;i<2;++i)rw[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;rw[0].dstSet=g_fsr.rcasSet[eye];rw[0].dstBinding=1;rw[0].descriptorCount=1;rw[0].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;rw[0].pImageInfo=&rin;rw[1].dstSet=g_fsr.rcasSet[eye];rw[1].dstBinding=2;rw[1].descriptorCount=1;rw[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;rw[1].pImageInfo=&rout;vkUpdateDescriptorSets(g_vkDevice,2,rw,0,nullptr);}
             VkImageMemoryBarrier pre[4]{}; int pc=0;
             auto ib=[&](VkImage image,VkImageLayout oldL,VkImageLayout newL,VkAccessFlags srcA,VkAccessFlags dstA){VkImageMemoryBarrier& x=pre[pc++];x.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;x.srcAccessMask=srcA;x.dstAccessMask=dstA;x.oldLayout=oldL;x.newLayout=newL;x.srcQueueFamilyIndex=x.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;x.image=image;x.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};};
             ib(src,srcLayout,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
@@ -1487,12 +1551,12 @@ namespace ahitvr
             ib(dst,dstLayout,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,pc,pre);
             const uint32_t gx=(dstW+15)/16,gy=(dstH+15)/16;
-            vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.easuPipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.pipelineLayout,0,1,&g_fsr.easuSet,0,nullptr);vkCmdDispatch(cmd,gx,gy,1);
-            if(useRcas){VkImageMemoryBarrier mid{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};mid.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mid.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;mid.oldLayout=VK_IMAGE_LAYOUT_GENERAL;mid.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;mid.srcQueueFamilyIndex=mid.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;mid.image=g_fsr.intermediate;mid.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,0,nullptr,1,&mid);vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.rcasPipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.pipelineLayout,0,1,&g_fsr.rcasSet,0,nullptr);vkCmdDispatch(cmd,gx,gy,1);}
+            vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.easuPipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.pipelineLayout,0,1,&g_fsr.easuSet[eye],0,nullptr);vkCmdDispatch(cmd,gx,gy,1);
+            if(useRcas){VkImageMemoryBarrier mid{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};mid.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;mid.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;mid.oldLayout=VK_IMAGE_LAYOUT_GENERAL;mid.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;mid.srcQueueFamilyIndex=mid.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;mid.image=g_fsr.intermediate;mid.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,0,nullptr,1,&mid);vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.rcasPipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,g_fsr.pipelineLayout,0,1,&g_fsr.rcasSet[eye],0,nullptr);vkCmdDispatch(cmd,gx,gy,1);}
             VkImageMemoryBarrier ready{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};ready.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;ready.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;ready.oldLayout=VK_IMAGE_LAYOUT_GENERAL;ready.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;ready.srcQueueFamilyIndex=ready.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;ready.image=g_fsr.output;ready.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&ready);
             VkImageBlit bl{};bl.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};bl.srcOffsets[1]={(int32_t)dstW,(int32_t)dstH,1};bl.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};bl.dstOffsets[1]={(int32_t)dstW,(int32_t)dstH,1};vkCmdBlitImage(cmd,g_fsr.output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&bl,VK_FILTER_NEAREST);
             VkImageMemoryBarrier restore[2]{};restore[0].sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;restore[0].srcAccessMask=VK_ACCESS_SHADER_READ_BIT;restore[0].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;restore[0].oldLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;restore[0].newLayout=srcLayout;restore[0].srcQueueFamilyIndex=restore[0].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;restore[0].image=src;restore[0].subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};restore[1]=restore[0];restore[1].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;restore[1].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;restore[1].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;restore[1].newLayout=dstLayout;restore[1].image=dst;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,2,restore);
-            return srcView;
+            return true;
         }
 
         // Always separate DXVK and OpenXR logical devices. DXVK's D3D9 VkImage
@@ -1506,6 +1570,7 @@ namespace ahitvr
             VkDeviceMemory xrMemory = VK_NULL_HANDLE;
             VkSemaphore dxvkSemaphore = VK_NULL_HANDLE;
             VkSemaphore xrSemaphore = VK_NULL_HANDLE;
+            VkImageView xrView = VK_NULL_HANDLE; // cached upscaler source view of xrImage
             HANDLE memoryHandle = nullptr;
             HANDLE semaphoreHandle = nullptr;
             uint32_t width = 0, height = 0;
@@ -1513,9 +1578,13 @@ namespace ahitvr
             bool externalOwnedByXr = false;
         };
         Phase6EyeBridge g_phase6Eye[3] = {};
+        // per slot dxvk queue copy resources. a single shared fence would make
+        // the right eye wait (on the cpu) for the left eye's copy, which is stuck
+        // behind the whole frame's game rendering on dxvk's queue.
         VkCommandPool g_phase6DxvkCommandPool = VK_NULL_HANDLE;
-        VkCommandBuffer g_phase6DxvkCommandBuffer = VK_NULL_HANDLE;
-        VkFence g_phase6DxvkFence = VK_NULL_HANDLE;
+        VkCommandBuffer g_phase6DxvkCommandBuffer[3] = {};
+        VkFence g_phase6DxvkFence[3] = {};
+        bool g_phase6DxvkPending[3] = {};
         bool g_phase6Unavailable = false;
         bool g_phase6LoggedActive = false;
 
@@ -1608,20 +1677,32 @@ namespace ahitvr
 
         bool EnsurePhase6DxvkCommands()
         {
-            if (g_phase6DxvkCommandPool && g_phase6DxvkCommandBuffer && g_phase6DxvkFence) return true;
+            if (g_phase6DxvkCommandPool && g_phase6DxvkCommandBuffer[2] && g_phase6DxvkFence[2]) return true;
             if (!g_dxvkProbeDevice || g_dxvkProbeQueueFamily == UINT32_MAX) return false;
-            VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-            pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-            pci.queueFamilyIndex = g_dxvkProbeQueueFamily;
-            if (vkCreateCommandPool(g_dxvkProbeDevice, &pci, nullptr, &g_phase6DxvkCommandPool) != VK_SUCCESS) return false;
-            VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cai.commandPool = g_phase6DxvkCommandPool;
-            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cai.commandBufferCount = 1;
-            if (vkAllocateCommandBuffers(g_dxvkProbeDevice, &cai, &g_phase6DxvkCommandBuffer) != VK_SUCCESS) return false;
-            VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-            fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // first reuse wait must not block
-            if (vkCreateFence(g_dxvkProbeDevice, &fci, nullptr, &g_phase6DxvkFence) != VK_SUCCESS) return false;
+            if (!g_phase6DxvkCommandPool)
+            {
+                VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+                pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                pci.queueFamilyIndex = g_dxvkProbeQueueFamily;
+                if (vkCreateCommandPool(g_dxvkProbeDevice, &pci, nullptr, &g_phase6DxvkCommandPool) != VK_SUCCESS) return false;
+            }
+            for (int slot = 0; slot < 3; ++slot)
+            {
+                if (!g_phase6DxvkCommandBuffer[slot])
+                {
+                    VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+                    cai.commandPool = g_phase6DxvkCommandPool;
+                    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                    cai.commandBufferCount = 1;
+                    if (vkAllocateCommandBuffers(g_dxvkProbeDevice, &cai, &g_phase6DxvkCommandBuffer[slot]) != VK_SUCCESS) return false;
+                }
+                if (!g_phase6DxvkFence[slot])
+                {
+                    VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+                    if (vkCreateFence(g_dxvkProbeDevice, &fci, nullptr, &g_phase6DxvkFence[slot]) != VK_SUCCESS) return false;
+                    g_phase6DxvkPending[slot] = false;
+                }
+            }
             return true;
         }
 
@@ -1638,6 +1719,9 @@ namespace ahitvr
             // live resize can never destroy an image/semaphore still referenced by a GPU.
             if (g_vkDevice) vkDeviceWaitIdle(g_vkDevice);
             if (g_dxvkProbeDevice) vkDeviceWaitIdle(g_dxvkProbeDevice);
+            g_bridgeXrSubmit[slot].pending = false;
+            g_phase6DxvkPending[slot] = false;
+            if (b.xrView && g_vkDevice) vkDestroyImageView(g_vkDevice, b.xrView, nullptr);
             if (b.xrSemaphore && g_vkDevice) vkDestroySemaphore(g_vkDevice, b.xrSemaphore, nullptr);
             if (b.dxvkSemaphore && g_dxvkProbeDevice) vkDestroySemaphore(g_dxvkProbeDevice, b.dxvkSemaphore, nullptr);
             if (b.xrImage && g_vkDevice) vkDestroyImage(g_vkDevice, b.xrImage, nullptr);
@@ -1794,6 +1878,12 @@ namespace ahitvr
             if (!texture || !dstImage || !EnsurePhase6EyeBridge(slot, bridgeW, bridgeH) || !EnsureCommandResources())
                 return false;
             auto& b = g_phase6Eye[slot];
+            if (wantNis && !b.xrView)
+            {
+                // cached for as long as the bridge image lives, destroyed along with the bridge.
+                b.xrView = CreateNisView(b.xrImage, VK_FORMAT_B8G8R8A8_UNORM);
+                if (!b.xrView) return false;
+            }
             ID3D9VkInteropTextureHatVR* texInterop = nullptr;
             IDirect3DDevice9* d3dDevice = nullptr;
             ID3D9VkInteropDevicePhase5* devInterop = nullptr;
@@ -1823,32 +1913,49 @@ namespace ahitvr
                 goto fail;
             }
 
-            // Stage A: DXVK queue copies source texture -> shared image, then releases it externally.
-            devInterop->LockSubmissionQueue();
+            // slot reuse. this slot's submissions from last frame have to be done
+            // before I overwrite its shared image, command buffers, upscaler
+            // descriptor set or cross device semaphore. waiting on the xr fence
+            // covers all of it since the xr copy waited on the dxvk copy's semaphore.
+            // a frame has passed since that submission, so it's usually
+            // already signaled, and when gpu bound it's what paces the frames.
+            // done before taking dxvk's submission lock so dxvk never gets stalled.
+            producerWait = WaitBridgeXrSlot(slot);
+            if (producerWait != VK_SUCCESS) {
+                bridgeCommandsTouched = true; // don't know the fence state, so no blind retry
+                DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=xr-slot-fence-wait slot=%d vk=%d", slot, (int)producerWait);
+                goto fail;
+            }
             // A previous XR-queue wait consumes the cross-device semaphore,
             // but the DXVK submission fence must independently be signaled
             // before Vulkan permits us to reset/reuse it.
-            producerWait = vkWaitForFences(g_dxvkProbeDevice, 1,
-                &g_phase6DxvkFence, VK_TRUE, UINT64_MAX);
-            if (producerWait != VK_SUCCESS) {
-                bridgeCommandsTouched = true; // unknown producer fence state; no blind retry
-                DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=dxvk-fence-wait slot=%d vk=%d", slot, (int)producerWait);
-                goto dx_locked_fail;
+            if (g_phase6DxvkPending[slot])
+            {
+                producerWait = vkWaitForFences(g_dxvkProbeDevice, 1,
+                    &g_phase6DxvkFence[slot], VK_TRUE, kBridgeFenceTimeoutNs);
+                if (producerWait != VK_SUCCESS) {
+                    bridgeCommandsTouched = true; // unknown producer fence state; no blind retry
+                    DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=dxvk-fence-wait slot=%d vk=%d", slot, (int)producerWait);
+                    goto fail;
+                }
+                g_phase6DxvkPending[slot] = false;
             }
-            bridgeCommandsTouched = true; // resetting the fence makes a retry unsafe without a full rebuild
-            vkResetFences(g_dxvkProbeDevice, 1, &g_phase6DxvkFence);
-            vkResetCommandBuffer(g_phase6DxvkCommandBuffer, 0);
+
+            // Stage A: DXVK queue copies source texture -> shared image, then releases it externally.
+            devInterop->LockSubmissionQueue();
+            bridgeCommandsTouched = true; // once I record into the slot a retry isn't safe without a full rebuild
+            vkResetCommandBuffer(g_phase6DxvkCommandBuffer[slot], 0);
             {
                 VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                if (vkBeginCommandBuffer(g_phase6DxvkCommandBuffer, &bi) != VK_SUCCESS) goto dx_locked_fail;
+                if (vkBeginCommandBuffer(g_phase6DxvkCommandBuffer[slot], &bi) != VK_SUCCESS) goto dx_locked_fail;
                 VkImageMemoryBarrier pre[2]{};
                 pre[0].sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER; pre[0].srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT; pre[0].dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
                 pre[0].oldLayout=srcLayout; pre[0].newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; pre[0].srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; pre[0].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; pre[0].image=srcImage; pre[0].subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
                 pre[1].sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER; pre[1].srcAccessMask=0; pre[1].dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
                 pre[1].oldLayout=b.externalOwnedByXr ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED; pre[1].newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 pre[1].srcQueueFamilyIndex=b.externalOwnedByXr ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED; pre[1].dstQueueFamilyIndex=g_dxvkProbeQueueFamily; pre[1].image=b.dxvkImage; pre[1].subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
-                vkCmdPipelineBarrier(g_phase6DxvkCommandBuffer,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,2,pre);
+                vkCmdPipelineBarrier(g_phase6DxvkCommandBuffer[slot],VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,2,pre);
                 if (nativeStereoFullEye && slot >= 0 && slot < 2)
                 {
                     // native Stereo now folds the old horizontal crop into
@@ -1861,7 +1968,7 @@ namespace ahitvr
                     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
                     blit.dstOffsets[0] = {0,0,0};
                     blit.dstOffsets[1] = {(int32_t)b.width,(int32_t)b.height,1};
-                    vkCmdBlitImage(g_phase6DxvkCommandBuffer, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    vkCmdBlitImage(g_phase6DxvkCommandBuffer[slot], srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         b.dxvkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
                     if (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL) == 0)
                         DxvkPathTrace(
@@ -1902,7 +2009,7 @@ namespace ahitvr
                     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
                     blit.dstOffsets[0] = {0,0,0};
                     blit.dstOffsets[1] = {(int32_t)b.width,(int32_t)b.height,1};
-                    vkCmdBlitImage(g_phase6DxvkCommandBuffer, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    vkCmdBlitImage(g_phase6DxvkCommandBuffer[slot], srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         b.dxvkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 
                     if (g_vkSubmitSerial <= 12 || (g_vkSubmitSerial % 300ULL) == 0)
@@ -1949,7 +2056,7 @@ namespace ahitvr
                         blit.dstOffsets[1] = {(int32_t)b.width,(int32_t)b.height,1};
 
                         vkCmdBlitImage(
-                            g_phase6DxvkCommandBuffer,
+                            g_phase6DxvkCommandBuffer[slot],
                             srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                             b.dxvkImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                             1, &blit, VK_FILTER_LINEAR);
@@ -1976,51 +2083,58 @@ namespace ahitvr
                         blit.srcOffsets[1] = {sourceX+(int32_t)srcWidth,(int32_t)srcHeight,1};
                         blit.dstOffsets[0] = {0,0,0};
                         blit.dstOffsets[1] = {(int32_t)b.width,(int32_t)b.height,1};
-                        vkCmdBlitImage(g_phase6DxvkCommandBuffer,srcImage,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.dxvkImage,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_LINEAR);
+                        vkCmdBlitImage(g_phase6DxvkCommandBuffer[slot],srcImage,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.dxvkImage,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_LINEAR);
                     }
                 }
                 VkImageMemoryBarrier post[2]{};
                 post[0]=pre[0]; post[0].srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT; post[0].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT; post[0].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; post[0].newLayout=srcLayout;
                 post[1]=pre[1]; post[1].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; post[1].dstAccessMask=0; post[1].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; post[1].newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; post[1].srcQueueFamilyIndex=g_dxvkProbeQueueFamily; post[1].dstQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL;
-                vkCmdPipelineBarrier(g_phase6DxvkCommandBuffer,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,2,post);
-                if (vkEndCommandBuffer(g_phase6DxvkCommandBuffer)!=VK_SUCCESS) goto dx_locked_fail;
-                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&g_phase6DxvkCommandBuffer; si.signalSemaphoreCount=1; si.pSignalSemaphores=&b.dxvkSemaphore;
-                VkResult submitVk = vkQueueSubmit(g_dxvkProbeQueue,1,&si,g_phase6DxvkFence);
+                vkCmdPipelineBarrier(g_phase6DxvkCommandBuffer[slot],VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,2,post);
+                if (vkEndCommandBuffer(g_phase6DxvkCommandBuffer[slot])!=VK_SUCCESS) goto dx_locked_fail;
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&g_phase6DxvkCommandBuffer[slot]; si.signalSemaphoreCount=1; si.pSignalSemaphores=&b.dxvkSemaphore;
+                // only reset right before submitting so an earlier failure never
+                // leaves behind an unsignaled fence that a later wait would hang on.
+                vkResetFences(g_dxvkProbeDevice, 1, &g_phase6DxvkFence[slot]);
+                VkResult submitVk = vkQueueSubmit(g_dxvkProbeQueue,1,&si,g_phase6DxvkFence[slot]);
                 if (submitVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=dxvk-submit slot=%d vk=%d", slot, (int)submitVk); goto dx_locked_fail; }
+                g_phase6DxvkPending[slot] = true;
             }
             devInterop->ReleaseSubmissionQueue();
 
             // Stage B: XR queue waits entirely on-GPU, acquires shared image, copies -> swapchain.
-            vkResetFences(g_vkDevice,1,&g_vkFence); vkResetCommandBuffer(g_vkCommandBuffer,0);
+            // only submitted, no cpu wait. openxr just needs the copy to be submitted
+            // to the session queue before xrReleaseSwapchainImage, not finished.
+            vkResetCommandBuffer(g_bridgeXrSubmit[slot].cb,0);
             {
+                VkCommandBuffer xrCb=g_bridgeXrSubmit[slot].cb;
                 VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                if(vkBeginCommandBuffer(g_vkCommandBuffer,&bi)!=VK_SUCCESS) goto fail;
+                if(vkBeginCommandBuffer(xrCb,&bi)!=VK_SUCCESS) goto fail;
                 VkImageMemoryBarrier acquire{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; acquire.srcAccessMask=0; acquire.dstAccessMask=wantNis?VK_ACCESS_SHADER_READ_BIT:VK_ACCESS_TRANSFER_READ_BIT; acquire.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; acquire.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; acquire.srcQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL; acquire.dstQueueFamilyIndex=g_vkQueueFamily; acquire.image=b.xrImage; acquire.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
-                vkCmdPipelineBarrier(g_vkCommandBuffer,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,wantNis?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&acquire);
-                VkImageView nisTempView=VK_NULL_HANDLE;
+                vkCmdPipelineBarrier(xrCb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,wantNis?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&acquire);
                 if(wantNis)
                 {
-                    nisTempView=(g_openXrUpscaler==1) ? RecordFsrUpscale(g_vkCommandBuffer,b.xrImage,VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.width,b.height,0,0,b.width,b.height,dstImage,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,dstWidth,dstHeight) : RecordNisUpscale(g_vkCommandBuffer,b.xrImage,VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.width,b.height,0,0,b.width,b.height,dstImage,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,dstWidth,dstHeight);
-                    if(!nisTempView) goto fail;
+                    const bool recorded=(g_openXrUpscaler==1) ? RecordFsrUpscale(xrCb,slot,b.xrImage,b.xrView,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.width,b.height,0,0,b.width,b.height,dstImage,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,dstWidth,dstHeight) : RecordNisUpscale(xrCb,slot,b.xrImage,b.xrView,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.width,b.height,0,0,b.width,b.height,dstImage,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,dstWidth,dstHeight);
+                    if(!recorded) goto fail;
                 }
                 else
                 {
                     VkImageMemoryBarrier d{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; d.srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT; d.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; d.oldLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; d.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; d.srcQueueFamilyIndex=d.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; d.image=dstImage; d.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
-                    vkCmdPipelineBarrier(g_vkCommandBuffer,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&d);
-                    VkImageCopy c{}; c.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; c.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; c.extent={dstWidth,dstHeight,1}; vkCmdCopyImage(g_vkCommandBuffer,b.xrImage,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,dstImage,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&c);
+                    vkCmdPipelineBarrier(xrCb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&d);
+                    VkImageCopy c{}; c.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; c.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; c.extent={dstWidth,dstHeight,1}; vkCmdCopyImage(xrCb,b.xrImage,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,dstImage,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&c);
                     d.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; d.dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT; d.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; d.newLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                    vkCmdPipelineBarrier(g_vkCommandBuffer,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&d);
+                    vkCmdPipelineBarrier(xrCb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&d);
                 }
                 VkImageMemoryBarrier release=acquire; release.srcAccessMask=wantNis?VK_ACCESS_SHADER_READ_BIT:VK_ACCESS_TRANSFER_READ_BIT; release.dstAccessMask=0; release.srcQueueFamilyIndex=g_vkQueueFamily; release.dstQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL;
-                vkCmdPipelineBarrier(g_vkCommandBuffer,wantNis?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&release);
-                if(vkEndCommandBuffer(g_vkCommandBuffer)!=VK_SUCCESS) goto fail;
+                vkCmdPipelineBarrier(xrCb,wantNis?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&release);
+                if(vkEndCommandBuffer(xrCb)!=VK_SUCCESS) goto fail;
                 VkPipelineStageFlags waitStage=VK_PIPELINE_STAGE_TRANSFER_BIT;
-                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.waitSemaphoreCount=1; si.pWaitSemaphores=&b.xrSemaphore; si.pWaitDstStageMask=&waitStage; si.commandBufferCount=1; si.pCommandBuffers=&g_vkCommandBuffer;
-                VkResult xrSubmitVk = vkQueueSubmit(g_vkQueue,1,&si,g_vkFence);
+                // nis/fsr first use the shared image in the compute stage.
+                if(wantNis) waitStage|=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.waitSemaphoreCount=1; si.pWaitSemaphores=&b.xrSemaphore; si.pWaitDstStageMask=&waitStage; si.commandBufferCount=1; si.pCommandBuffers=&xrCb;
+                vkResetFences(g_vkDevice,1,&g_bridgeXrSubmit[slot].fence);
+                VkResult xrSubmitVk = vkQueueSubmit(g_vkQueue,1,&si,g_bridgeXrSubmit[slot].fence);
                 if(xrSubmitVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=xr-submit slot=%d vk=%d", slot, (int)xrSubmitVk); goto fail; }
-                VkResult xrFenceVk = vkWaitForFences(g_vkDevice,1,&g_vkFence,VK_TRUE,UINT64_MAX);
-                if(xrFenceVk != VK_SUCCESS) { DxvkPathTrace("VKBRIDGE-SYNC FAILED stage=xr-fence-wait slot=%d vk=%d", slot, (int)xrFenceVk); goto fail; }
-                if(nisTempView) vkDestroyImageView(g_vkDevice,nisTempView,nullptr);
+                g_bridgeXrSubmit[slot].pending=true;
             }
             b.externalOwnedByXr=true;
             if(!g_phase6LoggedActive){ DxvkPathTrace("VKBRIDGE-V5 PHASE8 DIRECT-SBS GPU-ONLY ACTIVE - original SBS VkImage, no D3D9 eye StretchRects, no CPU pixels"); g_phase6LoggedActive=true; }
@@ -2551,11 +2665,16 @@ namespace ahitvr
         if (!image || !g_vkDevice || !g_vkQueue || !EnsureCommandResources())
             return false;
 
-        vkResetFences(g_vkDevice, 1, &g_vkFence);
-        vkResetCommandBuffer(g_vkCommandBuffer, 0);
+        // shares the ui bridge slot (2): the ui image either gets copied or
+        // cleared each frame, never both, so one submission in flight is enough.
+        if (WaitBridgeXrSlot(2) != VK_SUCCESS)
+            return false;
+        BridgeXrSubmit& uiSlot = g_bridgeXrSubmit[2];
+        VkCommandBuffer cb = uiSlot.cb;
+        vkResetCommandBuffer(cb, 0);
         VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vkBeginCommandBuffer(g_vkCommandBuffer, &bi) != VK_SUCCESS)
+        if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS)
             return false;
 
         VkImageSubresourceRange range{};
@@ -2574,13 +2693,13 @@ namespace ahitvr
         toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.image = image;
         toTransfer.subresourceRange = range;
-        vkCmdPipelineBarrier(g_vkCommandBuffer,
+        vkCmdPipelineBarrier(cb,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
             0, nullptr, 0, nullptr, 1, &toTransfer);
 
         const VkClearColorValue transparent = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
-        vkCmdClearColorImage(g_vkCommandBuffer, image,
+        vkCmdClearColorImage(cb, image,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &range);
 
         VkImageMemoryBarrier toColor{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -2592,19 +2711,22 @@ namespace ahitvr
         toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toColor.image = image;
         toColor.subresourceRange = range;
-        vkCmdPipelineBarrier(g_vkCommandBuffer,
+        vkCmdPipelineBarrier(cb,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
             0, nullptr, 0, nullptr, 1, &toColor);
 
-        if (vkEndCommandBuffer(g_vkCommandBuffer) != VK_SUCCESS)
+        if (vkEndCommandBuffer(cb) != VK_SUCCESS)
             return false;
         VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
         si.commandBufferCount = 1;
-        si.pCommandBuffers = &g_vkCommandBuffer;
-        if (vkQueueSubmit(g_vkQueue, 1, &si, g_vkFence) != VK_SUCCESS)
+        si.pCommandBuffers = &cb;
+        vkResetFences(g_vkDevice, 1, &uiSlot.fence);
+        if (vkQueueSubmit(g_vkQueue, 1, &si, uiSlot.fence) != VK_SUCCESS)
             return false;
-        return vkWaitForFences(g_vkDevice, 1, &g_vkFence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+        // only submitted, the slot fence gets waited on next time slot 2 is reused.
+        uiSlot.pending = true;
+        return true;
     }
 
     bool SubmitVulkanOpenXREyes(
@@ -3111,6 +3233,7 @@ namespace ahitvr
         if (g_dxvkProbeDevice) vkDeviceWaitIdle(g_dxvkProbeDevice);
         for (auto& b : g_phase6Eye)
         {
+            if (b.xrView && g_vkDevice) vkDestroyImageView(g_vkDevice, b.xrView, nullptr);
             if (b.xrSemaphore && g_vkDevice) vkDestroySemaphore(g_vkDevice, b.xrSemaphore, nullptr);
             if (b.dxvkSemaphore && g_dxvkProbeDevice) vkDestroySemaphore(g_dxvkProbeDevice, b.dxvkSemaphore, nullptr);
             if (b.xrImage && g_vkDevice) vkDestroyImage(g_vkDevice, b.xrImage, nullptr);
@@ -3121,27 +3244,36 @@ namespace ahitvr
             if (b.semaphoreHandle) CloseHandle(b.semaphoreHandle);
             b = {};
         }
-        if (g_phase6DxvkFence && g_dxvkProbeDevice) vkDestroyFence(g_dxvkProbeDevice, g_phase6DxvkFence, nullptr);
+        for (int slot = 0; slot < 3; ++slot)
+        {
+            if (g_phase6DxvkFence[slot] && g_dxvkProbeDevice) vkDestroyFence(g_dxvkProbeDevice, g_phase6DxvkFence[slot], nullptr);
+            g_phase6DxvkFence[slot] = VK_NULL_HANDLE;
+            g_phase6DxvkCommandBuffer[slot] = VK_NULL_HANDLE; // freed along with the pool
+            g_phase6DxvkPending[slot] = false;
+        }
         if (g_phase6DxvkCommandPool && g_dxvkProbeDevice) vkDestroyCommandPool(g_dxvkProbeDevice, g_phase6DxvkCommandPool, nullptr);
-        g_phase6DxvkFence = VK_NULL_HANDLE; g_phase6DxvkCommandPool = VK_NULL_HANDLE; g_phase6DxvkCommandBuffer = VK_NULL_HANDLE;
+        g_phase6DxvkCommandPool = VK_NULL_HANDLE;
 
         if(g_vkDevice)
         {
-            if(g_fsr.easuMapped && g_fsr.easuConstantsMem) vkUnmapMemory(g_vkDevice,g_fsr.easuConstantsMem); if(g_fsr.rcasMapped && g_fsr.rcasConstantsMem) vkUnmapMemory(g_vkDevice,g_fsr.rcasConstantsMem);
+            for(int eye=0;eye<2;++eye)
+            {
+                if(g_fsr.easuMapped[eye] && g_fsr.easuConstantsMem[eye]) vkUnmapMemory(g_vkDevice,g_fsr.easuConstantsMem[eye]); if(g_fsr.rcasMapped[eye] && g_fsr.rcasConstantsMem[eye]) vkUnmapMemory(g_vkDevice,g_fsr.rcasConstantsMem[eye]);
+                if(g_fsr.easuConstants[eye]) vkDestroyBuffer(g_vkDevice,g_fsr.easuConstants[eye],nullptr); if(g_fsr.easuConstantsMem[eye]) vkFreeMemory(g_vkDevice,g_fsr.easuConstantsMem[eye],nullptr); if(g_fsr.rcasConstants[eye]) vkDestroyBuffer(g_vkDevice,g_fsr.rcasConstants[eye],nullptr); if(g_fsr.rcasConstantsMem[eye]) vkFreeMemory(g_vkDevice,g_fsr.rcasConstantsMem[eye],nullptr);
+                if(g_nis.configMapped[eye] && g_nis.configMemory[eye]) vkUnmapMemory(g_vkDevice,g_nis.configMemory[eye]);
+                if(g_nis.configBuffer[eye]) vkDestroyBuffer(g_vkDevice,g_nis.configBuffer[eye],nullptr); if(g_nis.configMemory[eye]) vkFreeMemory(g_vkDevice,g_nis.configMemory[eye],nullptr);
+            }
             if(g_fsr.intermediateView) vkDestroyImageView(g_vkDevice,g_fsr.intermediateView,nullptr); if(g_fsr.outputView) vkDestroyImageView(g_vkDevice,g_fsr.outputView,nullptr);
             if(g_fsr.intermediate) vkDestroyImage(g_vkDevice,g_fsr.intermediate,nullptr); if(g_fsr.intermediateMem) vkFreeMemory(g_vkDevice,g_fsr.intermediateMem,nullptr); if(g_fsr.output) vkDestroyImage(g_vkDevice,g_fsr.output,nullptr); if(g_fsr.outputMem) vkFreeMemory(g_vkDevice,g_fsr.outputMem,nullptr);
             if(g_fsr.easuPipeline) vkDestroyPipeline(g_vkDevice,g_fsr.easuPipeline,nullptr); if(g_fsr.rcasPipeline) vkDestroyPipeline(g_vkDevice,g_fsr.rcasPipeline,nullptr); if(g_fsr.pipelineLayout) vkDestroyPipelineLayout(g_vkDevice,g_fsr.pipelineLayout,nullptr);
-            if(g_fsr.easuConstants) vkDestroyBuffer(g_vkDevice,g_fsr.easuConstants,nullptr); if(g_fsr.easuConstantsMem) vkFreeMemory(g_vkDevice,g_fsr.easuConstantsMem,nullptr); if(g_fsr.rcasConstants) vkDestroyBuffer(g_vkDevice,g_fsr.rcasConstants,nullptr); if(g_fsr.rcasConstantsMem) vkFreeMemory(g_vkDevice,g_fsr.rcasConstantsMem,nullptr);
             if(g_fsr.pool) vkDestroyDescriptorPool(g_vkDevice,g_fsr.pool,nullptr); if(g_fsr.setLayout) vkDestroyDescriptorSetLayout(g_vkDevice,g_fsr.setLayout,nullptr); if(g_fsr.sampler) vkDestroySampler(g_vkDevice,g_fsr.sampler,nullptr);
             if(g_fsr.easuShader) vkDestroyShaderModule(g_vkDevice,g_fsr.easuShader,nullptr); if(g_fsr.rcasShader) vkDestroyShaderModule(g_vkDevice,g_fsr.rcasShader,nullptr); g_fsr={};
-            if(g_nis.configMapped && g_nis.configMemory) vkUnmapMemory(g_vkDevice,g_nis.configMemory);
             if(g_nis.outputView) vkDestroyImageView(g_vkDevice,g_nis.outputView,nullptr);
             if(g_nis.output) vkDestroyImage(g_vkDevice,g_nis.output,nullptr); if(g_nis.outputMem) vkFreeMemory(g_vkDevice,g_nis.outputMem,nullptr);
             if(g_nis.coefScaleView) vkDestroyImageView(g_vkDevice,g_nis.coefScaleView,nullptr); if(g_nis.coefUsmView) vkDestroyImageView(g_vkDevice,g_nis.coefUsmView,nullptr);
             if(g_nis.coefScale) vkDestroyImage(g_vkDevice,g_nis.coefScale,nullptr); if(g_nis.coefScaleMem) vkFreeMemory(g_vkDevice,g_nis.coefScaleMem,nullptr);
             if(g_nis.coefUsm) vkDestroyImage(g_vkDevice,g_nis.coefUsm,nullptr); if(g_nis.coefUsmMem) vkFreeMemory(g_vkDevice,g_nis.coefUsmMem,nullptr);
             if(g_nis.pipeline) vkDestroyPipeline(g_vkDevice,g_nis.pipeline,nullptr); if(g_nis.pipelineLayout) vkDestroyPipelineLayout(g_vkDevice,g_nis.pipelineLayout,nullptr);
-            if(g_nis.configBuffer) vkDestroyBuffer(g_vkDevice,g_nis.configBuffer,nullptr); if(g_nis.configMemory) vkFreeMemory(g_vkDevice,g_nis.configMemory,nullptr);
             if(g_nis.pool) vkDestroyDescriptorPool(g_vkDevice,g_nis.pool,nullptr); if(g_nis.setLayout) vkDestroyDescriptorSetLayout(g_vkDevice,g_nis.setLayout,nullptr);
             if(g_nis.sampler) vkDestroySampler(g_vkDevice,g_nis.sampler,nullptr); if(g_nis.shader) vkDestroyShaderModule(g_vkDevice,g_nis.shader,nullptr);
             g_nis={};
@@ -3152,6 +3284,11 @@ namespace ahitvr
         {
             if (g_vkOwnsDevice) vkDeviceWaitIdle(g_vkDevice);
             if (g_vkFence) { vkDestroyFence(g_vkDevice, g_vkFence, nullptr); g_vkFence = VK_NULL_HANDLE; }
+            for (BridgeXrSubmit& s : g_bridgeXrSubmit)
+            {
+                if (s.fence) vkDestroyFence(g_vkDevice, s.fence, nullptr);
+                s = {}; // command buffers get freed with g_vkCommandPool below
+            }
             if (g_vkCommandPool) { vkDestroyCommandPool(g_vkDevice, g_vkCommandPool, nullptr); g_vkCommandPool = VK_NULL_HANDLE; g_vkCommandBuffer = VK_NULL_HANDLE; }
         }
         if (g_vkViewSpace != XR_NULL_HANDLE) { xrDestroySpace(g_vkViewSpace); g_vkViewSpace = XR_NULL_HANDLE; }

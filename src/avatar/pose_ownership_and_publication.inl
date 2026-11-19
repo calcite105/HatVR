@@ -276,9 +276,8 @@ static void __fastcall AV_V43HookedSkelControlBoundary(
 static bool AV_V43InstallSkelControlBoundaryHook()
 {
     if(g_avV43SkelControlBoundaryInstalled) return true;
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr);
-    if(!exe) return false;
-    void* target=(void*)(exe+0x693810ull);
+    if(!GameGroupAvailable("avatar")) return false;
+    void* target=GameAddrAs<void*>(GA_SkelControl);
 
     MH_STATUS st=MH_CreateHook(
         target,&AV_V43HookedSkelControlBoundary,

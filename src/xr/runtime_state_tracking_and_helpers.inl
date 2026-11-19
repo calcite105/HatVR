@@ -390,8 +390,15 @@ void VulkanTraceEndD3D9Resource(const char* label, long result, const void* d3dR
         // FUN_140A1E400:
         //   plVar2 = *(longlong **)(param_1 + 0x34);
         //   (**(code **)(*plVar2 + 0x2A0))(...)
+        // the device field offset is read from the game's code (+0x34 on the reference build).
+        const int deviceField = GameFieldOffset(GA_RhiDeviceField);
+        if (deviceField < 0)
+        {
+            g_rhiBackend2A0Logged = true; // lookup is final, never read a guessed field
+            return;
+        }
         void* backend =
-            *reinterpret_cast<void* const*>(rhiBytes + 0x34);
+            *reinterpret_cast<void* const*>(rhiBytes + deviceField);
         if (!backend)
             return;
 

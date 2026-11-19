@@ -3,8 +3,8 @@
 
 static constexpr int kHatVrModApiVersion = 1;
 static constexpr int kHatVrModApiCapabilities = 0x1F;
-static constexpr uintptr_t kHatVrGameModInstancesDataRva = 0x129AC80;
-static constexpr uintptr_t kHatVrGameModInstancesCountRva = 0x129AC88;
+// GameModInstances TArray (Data at +0, Count at +8), found per game build
+// (reference build rva 0x129AC80). 0 if it can't be found, then the mod api just stays off.
 
 struct HatVrApiInitParams { int32_t ApiVersion; int32_t Capabilities; };
 struct HatVrApiStateParams { int32_t ApiVersion; int32_t StateFlags; int32_t TrackingMask; };
@@ -23,7 +23,7 @@ static bool HatVrApiReadFieldName(uintptr_t field,char* out,size_t cap){
     if(!out||cap<2||!FP_V111PlausiblePtr(field))return false;out[0]=0;
     int32_t ni=-1;if(!FP_V123ObjectRawNameIndex(field,ni)||ni<0)return false;
     const uintptr_t exe=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    uintptr_t names=0;if(!exe||!FP_V18ReadPtr(exe+0x125CCE8,names)||!FP_V111PlausiblePtr(names))return false;
+    uintptr_t names=0;if(!exe||!FP_V18ReadPtr(FP_GNamesArrayAddress(),names)||!FP_V111PlausiblePtr(names))return false;
     uintptr_t entry=0;if(!FP_V18ReadPtr(names+uintptr_t(ni)*8,entry)||!FP_V111PlausiblePtr(entry))return false;
     const size_t n=(std::min)(cap-1,size_t(127));
     if(!FP_ReadMemory(reinterpret_cast<const void*>(entry+0x14),out,n))return false;
@@ -73,8 +73,8 @@ static void HatVrApiRegisterConsumer(uintptr_t object){
 static void HatVrApiDiscoverConsumers(){
     if(!g_hatVrModApiEnabled)return;
     const ULONGLONG now=GetTickCount64();if(now-g_hatVrApiLastDiscoveryMs<2000ULL&&g_hatVrApiLastSeenGameModCount>=0)return;g_hatVrApiLastDiscoveryMs=now;
-    const uintptr_t exe=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));if(!exe)return;
-    uintptr_t data=0;int32_t count=0;if(!FP_V18ReadPtr(exe+kHatVrGameModInstancesDataRva,data)||!FP_V18ReadI32(exe+kHatVrGameModInstancesCountRva,count)||count<0||count>4096)return;
+    const uintptr_t modArray=GameAddr(GA_GameModInstances);if(!modArray)return;
+    uintptr_t data=0;int32_t count=0;if(!FP_V18ReadPtr(modArray,data)||!FP_V18ReadI32(modArray+8,count)||count<0||count>4096)return;
     if(count!=g_hatVrApiLastSeenGameModCount){g_hatVrApiRejectedCount=0;for(auto& r:g_hatVrApiRejected)r=0;}
     g_hatVrApiLastSeenGameModCount=count;
     for(int i=g_hatVrApiConsumerCount-1;i>=0;--i){bool alive=false;for(int j=0;j<count;++j){uintptr_t o=0;if(FP_V18ReadPtr(data+uintptr_t(j)*8,o)&&o==g_hatVrApiConsumers[i].Object){alive=true;break;}}if(!alive)HatVrApiRemoveConsumer(g_hatVrApiConsumers[i].Object);}

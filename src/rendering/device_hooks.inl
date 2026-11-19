@@ -223,6 +223,16 @@
 
         DxvkPathTrace("V11 core VR hook installation ENTER");
 
+        // find every game function/data address for this game build first.
+        // without the core set vr can't work, so just stay inactive (flatscreen)
+        // instead of hooking code I don't recognize.
+        if (!ResolveGameAddresses())
+        {
+            InterlockedExchange(&coreState, 0);
+            DxvkPathTrace("V11 core VR hook installation ABORT: core game addresses not found in this game build");
+            return false;
+        }
+
         MH_STATUS status = MH_Initialize();
         if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
         {
@@ -272,8 +282,13 @@
         if (!exe)
             return false;
 
-        unsigned char* advance = exe + kViewportLoopAdvanceRva;
-        unsigned char* limit   = exe + kViewportLoopLimitRva;
+        unsigned char* advance = GameAddrAs<unsigned char*>(GA_ViewportLoopAdvance);
+        unsigned char* limit   = GameAddrAs<unsigned char*>(GA_ViewportLoopLimit);
+        if (!advance || !limit)
+        {
+            DxvkPathTrace("V177 RENDER_LOOP patch sites not found in this game build");
+            return false;
+        }
         const unsigned char originalAdvance[4] = {0x48,0x83,0xC7,0x08}; // add rdi,8
         const unsigned char originalLimit[6]   = {0x3B,0x99,0xE4,0x06,0x00,0x00}; // cmp ebx,[rcx+6E4]
         const unsigned char stereoAdvance[4]  = {0x90,0x90,0x90,0x90};

@@ -5,6 +5,34 @@
 //
 // were the remaining problem" path.
 
+// AHiT's player meshes use bip_neck as the head skinning anchor;
+// collapse that authored neck subtree to scale zero at the neck.
+// moved into its own function so the no tracking fallback can use it too.
+static void AV_CollapseHeadSubtree(AV_V27TArray64& sb,const AV_V16MasterRig& rig,const int* parents)
+{
+    const int neck=AV_V14FindBoneIndex(rig.mesh,"bip_neck");
+    if(neck<0 || neck>=rig.count) return;
+    AV_V27Atom48 anchor{};
+    if(!AV_V220ReadAtom(sb,neck,anchor)) return;
+    for(int b=0;b<rig.count;++b){
+        if(b!=neck && !AV_V259IsDescendantOf(b,neck,parents,rig.count))
+            continue;
+        // do not collapse either tracked arm if a custom rig
+        // happens to parent shoulders below neck.
+        if(b==rig.lUpper || b==rig.rUpper ||
+           AV_V259IsDescendantOf(b,rig.lUpper,parents,rig.count) ||
+           AV_V259IsDescendantOf(b,rig.rUpper,parents,rig.count))
+            continue;
+        AV_V27Atom48 a{};
+        if(!AV_V220ReadAtom(sb,b,a)) continue;
+        a.translation[0]=anchor.translation[0];
+        a.translation[1]=anchor.translation[1];
+        a.translation[2]=anchor.translation[2];
+        a.scale[0]=0.0f; a.scale[1]=0.0f; a.scale[2]=0.0f;
+        AV_V220WriteAtom(sb,b,a);
+    }
+}
+
 static void __fastcall AV_V215HookedBuildRefToLocal(
     AV_V27TArray64* output, void* component, int lodIndex, void* extra)
 {
@@ -16,7 +44,8 @@ static void __fastcall AV_V215HookedBuildRefToLocal(
     if(!s_avV10Banner){ s_avV10Banner=true; FP_Log("AV_V119_NATIVE_ROOT_ROOMSCALE ACTIVE -- single universal solver; attachment archaeology removed; arm-name discovery cached process-wide\n"); }
 
     const bool active=g_avV29ProbeEnabled && AV_V215IsHatKidFamily(comp) &&
-                      g_controllerGripPoseValid[1] && g_xrTrackingOriginSet;
+                      (g_controllerGripPoseValid[0] || g_controllerGripPoseValid[1]) &&
+                      g_xrTrackingOriginSet;
     QueryPerformanceCounter(&avPerfT1);
 
     AV_V27TArray64 sb{};
@@ -290,7 +319,10 @@ static void __fastcall AV_V215HookedBuildRefToLocal(
                     b==avV16Rig.rUpper ||
                     AV_V259IsDescendantOf(b,avV16Rig.rUpper,parents,avV16Rig.count);
                 // Resetting 0..3 to ref here would erase root inheritance.
-                if(!inLeftArm && !inRightArm)
+                // if an arm's controller isn't tracked it just keeps the game's own
+                // animation (solve() skips it below).
+                if((!inLeftArm || !g_controllerGripPoseValid[0]) &&
+                   (!inRightArm || !g_controllerGripPoseValid[1]))
                     ok &= AV_V220WriteAtom(sb,b,avV16Saved[b]);
             }
         }
@@ -655,33 +687,8 @@ static void __fastcall AV_V215HookedBuildRefToLocal(
             if(ok){
                 changed=true;
 
-                // AHiT's player meshes use bip_neck as the head skinning anchor;
-                // collapse that authored neck subtree to scale zero at the neck.
                 // do this after arm solving so it cannot alter shoulder/hand IK.
-                const int v93Neck=AV_V14FindBoneIndex(avV16Rig.mesh,"bip_neck");
-                if(v93Neck>=0 && v93Neck<avV16Rig.count){
-                    AV_V27Atom48 v93NeckAnchor{};
-                    if(AV_V220ReadAtom(sb,v93Neck,v93NeckAnchor)){
-                        for(int b=0;b<avV16Rig.count;++b){
-                            if(b!=v93Neck &&
-                               !AV_V259IsDescendantOf(b,v93Neck,parents,avV16Rig.count))
-                                continue;
-                            // do not collapse either tracked arm if a custom rig
-                            // happens to parent shoulders below neck.
-                            if(b==avV16Rig.lUpper || b==avV16Rig.rUpper ||
-                               AV_V259IsDescendantOf(b,avV16Rig.lUpper,parents,avV16Rig.count) ||
-                               AV_V259IsDescendantOf(b,avV16Rig.rUpper,parents,avV16Rig.count))
-                                continue;
-                            AV_V27Atom48 a{};
-                            if(!AV_V220ReadAtom(sb,b,a)) continue;
-                            a.translation[0]=v93NeckAnchor.translation[0];
-                            a.translation[1]=v93NeckAnchor.translation[1];
-                            a.translation[2]=v93NeckAnchor.translation[2];
-                            a.scale[0]=0.0f; a.scale[1]=0.0f; a.scale[2]=0.0f;
-                            AV_V220WriteAtom(sb,b,a);
-                        }
-                    }
-                }
+                AV_CollapseHeadSubtree(sb,avV16Rig,parents);
 
                 // BuildRefToLocal consumes it. Subsequent requests in this SAME
                 // present frame can replay it without repeating IK/ref-pose/local
@@ -718,6 +725,21 @@ static void __fastcall AV_V215HookedBuildRefToLocal(
                 // original SpaceBases are restored below. This is the exact lifetime
             }
         }
+    }
+
+    // no controllers tracked (lost tracking, or playing on a normal controller): the arm
+    // solve above gets skipped and the game's own animation is used as is, but
+    // the head still needs to stay hidden in first person like it normally does.
+    if(!active && g_avV29ProbeEnabled && AV_V215IsHatKidFamily(comp)){
+        AV_V16MasterRig headRig{};
+        int headParents[128]{};
+        static AV_V27Atom48 s_headRefScratch[128]{};
+        AV_V27TArray64 headSb{};
+        if(AV_V16ResolveMasterRig(poseComp,headRig) &&
+           headRig.count>0 && headRig.count<=128 &&
+           AV_V16ReadNonstandardRefPose(poseComp,headRig,headParents,s_headRefScratch) &&
+           AV_V27GetSpaceBases(poseComp,headSb) && headSb.Count>=headRig.count)
+            AV_CollapseHeadSubtree(headSb,headRig,headParents);
     }
 
 QueryPerformanceCounter(&avPerfT2);
@@ -918,14 +940,11 @@ static AV_V88Matrix* __fastcall AV_V88HookedBaseTransform(AV_V88Matrix* out, uin
 static bool AV_V88InstallBaseConsumerHook()
 {
     if(g_avV88BaseHookInstalled) return true;
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr);
-    if(!exe) return false;
-    constexpr uintptr_t kBaseTransformRva=0x4B85C0;
-    constexpr uintptr_t kGetBoneIndexRva=0x69E5D0;
-    constexpr uintptr_t kGetBoneMatrixRva=0x69B340;
-    g_avV88GetBoneIndex=(AV_V88GetBoneIndexFn)(exe+kGetBoneIndexRva);
-    g_avV88GetBoneMatrix=(AV_V88GetBoneMatrixFn)(exe+kGetBoneMatrixRva);
-    void* target=(void*)(exe+kBaseTransformRva);
+    // avatar hooks are all or nothing, don't install or call only some of them.
+    if(!GameGroupAvailable("avatar")){ FP_Log("AV_V88 avatar functions not found in this game build; avatar disabled\n"); return false; }
+    g_avV88GetBoneIndex=GameAddrAs<AV_V88GetBoneIndexFn>(GA_GetBoneIndex);
+    g_avV88GetBoneMatrix=GameAddrAs<AV_V88GetBoneMatrixFn>(GA_GetBoneMatrix);
+    void* target=GameAddrAs<void*>(GA_BaseTransform);
     MH_STATUS st=MH_CreateHook(target,&AV_V88HookedBaseTransform,reinterpret_cast<void**>(&g_avV88OriginalBaseTransform));
     if(st!=MH_OK && st!=MH_ERROR_ALREADY_CREATED){
         char l[256]{}; sprintf_s(l,sizeof(l),"AV_V88_BASE_HOOK_CREATE_FAIL target=%p status=%d\n",target,(int)st); FP_Log(l); return false;
@@ -937,7 +956,7 @@ static bool AV_V88InstallBaseConsumerHook()
     g_avV88BaseHookInstalled=true;
     char l[384]{}; sprintf_s(l,sizeof(l),
         "AV_V88_BASE_HOOK_INSTALLED target=%p rva=0x%llX getBoneIndex=%p getBoneMatrix=%p -- based skeletal attachments consume mapped master bone transforms\n",
-        target,(unsigned long long)kBaseTransformRva,(void*)g_avV88GetBoneIndex,(void*)g_avV88GetBoneMatrix); FP_Log(l);
+        target,(unsigned long long)GameRva(GA_BaseTransform),(void*)g_avV88GetBoneIndex,(void*)g_avV88GetBoneMatrix); FP_Log(l);
     return true;
 }
 

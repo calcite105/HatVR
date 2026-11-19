@@ -67,7 +67,8 @@ static char g_hatVrConfigPath[MAX_PATH] = {};
     // native ULocalPlayer::CalcSceneView candidate / debug camera
 
     // Ghidra: HatinTimeGame.exe image base 0x140000000, candidate at 0x1405D4870.
-    static constexpr uintptr_t kCalcSceneViewCandidateRva = 0x5D4390;
+    // reference build rva 0x5D4390, found per game build by signature now.
+    #define kCalcSceneViewCandidateRva (GameRva(GA_CalcSceneView))
 
     // the decompiler showed six arguments:
     //   (ULocalPlayer*, FSceneViewFamily*, FVector*, FRotator*, FViewport*, FViewElementDrawer*)
@@ -123,8 +124,9 @@ static char g_hatVrConfigPath[MAX_PATH] = {};
     // verified patches make GameViewportClient::Draw iterate twice over
     // GamePlayers[0] without changing the actual GamePlayers array/count.
     static bool g_nativeRenderLoopStereoActive = false;
-    static constexpr uintptr_t kViewportLoopAdvanceRva = 0x5D8BC9;
-    static constexpr uintptr_t kViewportLoopLimitRva   = 0x5D8BD1;
+    // reference build rvas 0x5D8BC9 / 0x5D8BD1, found per game build.
+    #define kViewportLoopAdvanceRva (GameRva(GA_ViewportLoopAdvance))
+    #define kViewportLoopLimitRva   (GameRva(GA_ViewportLoopLimit))
     static bool SetNativeRenderLoopStereoPatch(bool enable);
     static bool g_renderRightEye = false; // current eye while CalcSceneView is building a view
     // Game-thread-only eye identity for CalcSceneView/camera construction.
@@ -276,7 +278,8 @@ static char g_hatVrConfigPath[MAX_PATH] = {};
     // Implemented in first_person.inl after avatar_system.inl is included.
     static void SetUnifiedFirstPersonEnabled(bool enabled);
 
-    static constexpr uintptr_t kGameplayCalcSceneViewReturnRva = 0x5D84FE;
+    // reference build rva 0x5D84FE, found per game build (0 if it can't be found).
+    #define kGameplayCalcSceneViewReturnRva (GameRva(GA_GameplayCalcSceneViewRet))
     static float g_stereoHalfIpdUU = 3.2f; // 6.4 UU total at 100 UU / meter
 
     static IDirect3DTexture9* g_leftEyeCopy = nullptr;
@@ -296,7 +299,8 @@ static char g_hatVrConfigPath[MAX_PATH] = {};
 
     // OpenXR per-eye off-center projection hook. This is functional VR rendering,
     // not the removed scalar game-FOV override.
-    static constexpr uintptr_t kPerspectiveMatrixCandidateRva = 0x5D22A0;
+    // reference build rva 0x5D22A0, found per game build.
+    #define kPerspectiveMatrixCandidateRva (GameRva(GA_PerspectiveMatrix))
     using PerspectiveMatrixCandidateFn = float* (*)(
         float* outMatrix, float halfFovX, float halfFovY,
         float scaleX, float scaleY, float nearZ, float farZ);

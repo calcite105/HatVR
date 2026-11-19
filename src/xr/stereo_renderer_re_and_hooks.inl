@@ -119,12 +119,11 @@
         const unsigned int width = (maxX >= minX) ? (maxX - minX) : 0;
         const unsigned int height = (maxY >= minY) ? (maxY - minY) : 0;
         int factor = 0;
-        if (HMODULE exeForPp = GetModuleHandleW(nullptr))
+        if (const uintptr_t ppFactorAddress = GameAddr(GA_PostProcessSetting1103A54))
         {
             __try
             {
-                factor = *reinterpret_cast<volatile int*>(
-                    reinterpret_cast<uintptr_t>(exeForPp) + 0x1103A54);
+                factor = *reinterpret_cast<volatile int*>(ppFactorAddress);
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
@@ -143,7 +142,7 @@
             for (USHORT i = 0; i < frameCount; ++i)
             {
                 const uintptr_t p = reinterpret_cast<uintptr_t>(frames[i]);
-                if (exe && p >= exeBase && p < exeBase + 0x2000000)
+                if (exe && p >= exeBase && p < exeBase + GameImageSize())
                     stackRva[i] = (unsigned long long)(p - exeBase);
             }
 
@@ -405,9 +404,9 @@
 
     static int V41LivePpFactor()
     {
-        HMODULE exe = GetModuleHandleW(nullptr);
-        if (!exe) return -1;
-        __try { return *reinterpret_cast<volatile int*>(reinterpret_cast<uintptr_t>(exe)+0x1103A54); }
+        const uintptr_t address = GameAddr(GA_PostProcessSetting1103A54);
+        if (!address) return -1;
+        __try { return *reinterpret_cast<volatile int*>(address); }
         __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
     }
 
@@ -659,7 +658,7 @@
         }
 
         // renderer that is later queued as FDrawSceneCommand.
-        if (retRva == 0x5D8C29 || retRva == 0x5D822C)
+        if (retRva == GameRva(GA_GameplayDrawRetA) || retRva == GameRva(GA_GameplayDrawRetB))
         {
             LARGE_INTEGER q{};
             if (g_debugToolsEnabled) QueryPerformanceCounter(&q);
@@ -996,9 +995,9 @@
                     *rightOriginX += halfWidth;
 
                 using RebuildViewFn = void(__fastcall*)(void*, int);
-                const uintptr_t exeBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-                RebuildViewFn rebuild = reinterpret_cast<RebuildViewFn>(exeBase + 0x80A190);
-                rebuild(bl1RightView, 0);
+                RebuildViewFn rebuild = GameAddrAs<RebuildViewFn>(GA_RebuildView);
+                if (rebuild)
+                    rebuild(bl1RightView, 0);
 
                 auto* fam = reinterpret_cast<unsigned char*>(a2);
                 bl1SavedFamilyData = *reinterpret_cast<void***>(fam + 0x00);
@@ -1117,7 +1116,7 @@
                         {
                             uintptr_t fn = table[i];
                             unsigned long long rva =
-                                (exeBase && fn >= exeBase && fn < exeBase + 0x2000000ULL)
+                                (exeBase && fn >= exeBase && fn < exeBase + GameImageSize())
                                 ? (unsigned long long)(fn - exeBase) : 0ULL;
                             int w = _snprintf_s(
                                 slots + su, sizeof(slots) - su, _TRUNCATE,
@@ -1951,25 +1950,30 @@
 
     static bool InstallV67WorkCounterHooks()
     {
-        HMODULE exe=GetModuleHandleW(nullptr); if(!exe) return false;
-        struct H { uintptr_t rva; void* hook; void** original; };
+        // these hooks only work as a full set, don't ever install only some of them.
+        if(!GameGroupAvailable("stereo")) {
+            V67CounterLog("V67 stereo renderer hooks skipped: not all found in this game build\n");
+            return false;
+        }
+        struct H { GameAddrId id; void* hook; void** original; };
         H hooks[]={
-            {0x5D7DF0,(void*)&HookV26GameplayDraw,(void**)&g_originalV26GameplayDraw},
-            {0x81E7A0,(void*)&HookSceneProducer,(void**)&g_originalSceneProducer},
-            {0x81C9C0,(void*)&HookSceneRendererCreate,(void**)&g_originalSceneRendererCreate},
-            {0x825840,(void*)&HookV135SceneRender,(void**)&g_originalV135SceneRender},
-            {0x825F30,(void*)&HookV180PerViewDecal,(void**)&g_originalV180PerViewDecal},
-            {0x7E3850,(void*)&HookV186DetailRelevance,(void**)&g_originalV186DetailRelevance},
-            {0x820400,(void*)&HookSceneExecute,(void**)&g_originalSceneExecute},
-            {0x8334E0,(void*)&HookV40PpSetup,(void**)&g_originalV40PpSetup},
-            {0xA25F40,(void*)&HookV45RhiSetViewport,(void**)&g_originalV45RhiSetViewport},
-            {0x7FFDC0,(void*)&HookV46DrawQuad,(void**)&g_originalV46DrawQuad},
-            {0x7FAED0,(void*)&HookV50ViewStateFactory,(void**)&g_originalV50ViewStateFactory},
-            {0x7F21E0,(void*)&HookV50ViewStateCtor,(void**)&g_originalV50ViewStateCtor}
+            {GA_GameplayDraw,(void*)&HookV26GameplayDraw,(void**)&g_originalV26GameplayDraw},
+            {GA_SceneProducer,(void*)&HookSceneProducer,(void**)&g_originalSceneProducer},
+            {GA_SceneRendererCreate,(void*)&HookSceneRendererCreate,(void**)&g_originalSceneRendererCreate},
+            {GA_SceneRender,(void*)&HookV135SceneRender,(void**)&g_originalV135SceneRender},
+            {GA_PerViewDecal,(void*)&HookV180PerViewDecal,(void**)&g_originalV180PerViewDecal},
+            {GA_DetailRelevance,(void*)&HookV186DetailRelevance,(void**)&g_originalV186DetailRelevance},
+            {GA_SceneExecute,(void*)&HookSceneExecute,(void**)&g_originalSceneExecute},
+            {GA_PpSetup,(void*)&HookV40PpSetup,(void**)&g_originalV40PpSetup},
+            {GA_RhiSetViewport,(void*)&HookV45RhiSetViewport,(void**)&g_originalV45RhiSetViewport},
+            {GA_DrawQuad,(void*)&HookV46DrawQuad,(void**)&g_originalV46DrawQuad},
+            {GA_ViewStateFactory,(void*)&HookV50ViewStateFactory,(void**)&g_originalV50ViewStateFactory},
+            {GA_ViewStateCtor,(void*)&HookV50ViewStateCtor,(void**)&g_originalV50ViewStateCtor}
         };
         bool ok=true;
         for(const auto& h:hooks){
-            void* target=(void*)((uintptr_t)exe+h.rva);
+            void* target=GameAddrAs<void*>(h.id);
+            if(!target){ok=false;continue;}
             MH_STATUS st=MH_CreateHook(target,h.hook,h.original);
             if(st!=MH_OK && st!=MH_ERROR_ALREADY_CREATED){ok=false;continue;}
             st=MH_EnableHook(target);

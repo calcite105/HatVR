@@ -12,8 +12,8 @@
     //   Canvas finalize later reaches SHARED phase => close HUD window
     // this intentionally includes the tiny tail after Hat_HUD::PostRender but
     // excludes world rendering before it. All D3D hooks below are passive.
-    static constexpr uintptr_t kHudWindowResolverRva = 0x11D560;
-    static constexpr uintptr_t kHudWindowResolverReturnRva = 0x5D93CA;
+    // reference build rvas 0x11D560 / 0x5D93CA, found per game build.
+    #define kHudWindowResolverReturnRva (GameRva(GA_HudWindowResolverRet))
 
     using HudWindowResolverFn = void* (*)(void*, void*, unsigned int);
     static HudWindowResolverFn g_originalHudWindowResolver = nullptr;
@@ -40,8 +40,8 @@
     static bool InstallHudWindowResolverHook()
     {
         if (g_hudWindowResolverInstalled) return true;
-        HMODULE exe = GetModuleHandleW(nullptr); if (!exe) return false;
-        void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(exe) + kHudWindowResolverRva);
+        void* target = GameAddrAs<void*>(GA_HudWindowResolver);
+        if (!target || !GameAddr(GA_HudWindowResolverRet)) return false;
         MH_STATUS st = MH_CreateHook(target, &HookedHudWindowResolver, reinterpret_cast<void**>(&g_originalHudWindowResolver));
         if (st != MH_OK && st != MH_ERROR_ALREADY_CREATED) return false;
         st = MH_EnableHook(target);
@@ -87,7 +87,7 @@
     // Passive Canvas/FCanvas batched-geometry flush census
     // Ghidra: FUN_1407A13E0
     // this is the 48-byte-vertex batched geometry renderer sitting above the
-    static constexpr uintptr_t kCanvasBatchFlushRva = 0x7A19C0;
+    // reference build rva 0x7A19C0, found per game build (GA_CanvasBatchFlush).
 
     using CanvasBatchFlushFn = unsigned long long (*)(
         long long* batch,
@@ -131,7 +131,10 @@
 
     struct UiDrawCandidate
     {
-        uint64_t hash = 0;
+        uint64_t hash = 0;           // per build id: fnv of draw op + exe return rvas
+        uint64_t canonHash = 0;      // id that stays the same across builds (see UiCanonicalFrame)
+        uint64_t canonFrames[8] = {};// frames that stay the same across builds (kUiCandidateStackDepth)
+        unsigned int drawOp = 0;     // draw op the family was first seen with
         uintptr_t stackRvas[kUiCandidateStackDepth] = {};
         unsigned int stackCount = 0;
         unsigned long long hits = 0;
@@ -146,7 +149,81 @@
         bool markedGame = false; // hard override: keep this family in the game framebuffer
     };
 
+    // stack frame id that survives game updates: (size of the function it's in,
+    // offset of the return address inside it), taken from the exe's .pdata. functions
+    // whose code doesn't change in a game update keep the same size and internal
+    // offsets even if they move around, so the id still matches after updates. frames
+    // without unwind info just use their rva instead (tagged with the top bit).
+    static uint64_t UiCanonicalFrame(uintptr_t address, uintptr_t rva)
+    {
+        DWORD64 imageBase = 0;
+        const RUNTIME_FUNCTION* rf = RtlLookupFunctionEntry(
+            static_cast<DWORD64>(address), &imageBase, nullptr);
+        if (!rf || rf->EndAddress <= rf->BeginAddress ||
+            rva < rf->BeginAddress || rva >= rf->EndAddress)
+            return static_cast<uint64_t>(rva) | (1ULL << 63);
+        return (static_cast<uint64_t>(rf->EndAddress - rf->BeginAddress) << 32) |
+            static_cast<uint64_t>(rva - rf->BeginAddress);
+    }
+
+    // known ui draw families.
+    //   legacyHash  the old per build stack hash on the reference (public) build.
+    //   frames      frames that survive updates (UiCanonicalFrame), innermost first,
+    //               captured once on the public build (UI_FAMILY_NEW log lines).
+    //   ignoreMask  frames inside the game's d3d9 rhi draw dispatch layer. that
+    //               layer is generic (every ui draw goes through it) and it's exactly the
+    //               code that changes when the rhi class layout changes, so those
+    //               frames aren't compared. every other frame has to match exactly.
+    //
+    // checked against all 80 ui families captured on the public build: no
+    // other family matches any of these with this rule (so public works the same
+    // as before), and all three match on the 2026-11 experimental build.
+    // (just allowing N outer frames to mismatch doesn't work: A and KEEPALIVE
+    // both have sibling families that only differ in two outer frames.)
+    struct UiKnownFamily
+    {
+        uint64_t legacyHash;
+        unsigned int drawOp;
+        unsigned int frameCount;
+        uint64_t frames[8];
+        unsigned int ignoreMask;   // bit i set = frame i isn't compared
+    };
+
+    // family a: confirmed ui that goes on the detached openxr panel.
+    static constexpr UiKnownFamily kUiFamilyA{ 0x0CFC42F8ABB7D59CULL, 3, 8,
+        { 0xD4000000B1ULL, 0x2AA000000CFULL, 0x2C20000029AULL, 0x136000000C0ULL,
+          0x87F00000850ULL, 0x5650000037EULL, 0x31400000249ULL, 0x1FF000001BFULL }, 0x1u };
+    // family b: full sbs ui that gets replayed per eye.
+    static constexpr UiKnownFamily kUiFamilyB{ 0x08FBD6C0B1404765ULL, 3, 8,
+        { 0xD4000000B1ULL, 0x2AA000000CFULL, 0x1BD00000198ULL, 0x106000000F3ULL,
+          0x55400000527ULL, 0xF6000000D2ULL, 0x31400000294ULL, 0x1FF000001BFULL }, 0x1u };
+    // invisible draw that keeps happening and keeps the openxr ui fresh after level loads.
+    static constexpr UiKnownFamily kUiFamilyKeepAlive{ 0xC8D52F2D0E25F48AULL, 4, 8,
+        { 0x12F00000106ULL, 0x940000008FULL, 0xF7000000ECULL, 0x2AA00000168ULL,
+          0x1E3000001B9ULL, 0x480000002FULL, 0x89C000007EBULL, 0x510000003AULL }, 0x7u };
+    // pre hotfix (older game build) ui families. that build isn't on
+    // steam anymore, so only their old hashes are kept.
+    static constexpr UiKnownFamily kUiFamilyPreHotfix1{ 0xD2EFE7F4500173ECULL, 0, 0, {}, 0 };
+    static constexpr UiKnownFamily kUiFamilyPreHotfix2{ 0xF00EF310FF49C295ULL, 0, 0, {}, 0 };
+
     static UiDrawCandidate g_uiCandidates[kMaxUiCandidates] = {};
+
+    static bool UiCandidateIsFamily(const UiDrawCandidate& c, const UiKnownFamily& family)
+    {
+        if (c.hash == family.legacyHash)
+            return true;
+        if (family.frameCount == 0 || c.stackCount != family.frameCount ||
+            c.drawOp != family.drawOp)
+            return false;
+        for (unsigned int i = 0; i < family.frameCount; ++i)
+        {
+            if ((family.ignoreMask >> i) & 1u)
+                continue;
+            if (c.canonFrames[i] != family.frames[i])
+                return false;
+        }
+        return true;
+    }
     static unsigned int g_uiCandidateCount = 0;
     static int g_selectedUiCandidate = -1;
     static int g_uiCandidatePreviewMode = 0; // 0=normal, 1=force game/SBS, 2=force OpenXR
@@ -360,12 +437,16 @@
         void* frames[24] = {};
         const USHORT frameCount = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
         uintptr_t rvas[kUiCandidateStackDepth] = {};
+        uintptr_t addresses[kUiCandidateStackDepth] = {};
         unsigned int rvaCount = 0;
         for (USHORT i = 0; i < frameCount && rvaCount < kUiCandidateStackDepth; ++i)
         {
             const uintptr_t address = reinterpret_cast<uintptr_t>(frames[i]);
             if (address >= base && address < end)
+            {
+                addresses[rvaCount] = address;
                 rvas[rvaCount++] = address - base;
+            }
         }
         if (!rvaCount) return -1;
 
@@ -398,19 +479,72 @@
             c.hash = hash;
             c.stackCount = rvaCount;
             memcpy(c.stackRvas, rvas, rvaCount * sizeof(uintptr_t));
+
+            // id that survives updates, worked out once per new family.
+            c.drawOp = drawOp;
+            uint64_t canon = 14695981039346656037ULL;
+            canon ^= static_cast<uint64_t>(drawOp);
+            canon *= 1099511628211ULL;
+            for (unsigned int i = 0; i < rvaCount; ++i)
+            {
+                c.canonFrames[i] = UiCanonicalFrame(addresses[i], rvas[i]);
+                canon ^= c.canonFrames[i];
+                canon *= 1099511628211ULL;
+            }
+            c.canonHash = canon;
+
             // Confirmed interactively in CandidateSelector_v2.log.
             c.markedUi =
                 // Pre-hotfix confirmed UI families.
-                hash == 0xD2EFE7F4500173ECULL ||
-                hash == 0xF00EF310FF49C295ULL ||
+                UiCandidateIsFamily(c, kUiFamilyPreHotfix1) ||
+                UiCandidateIsFamily(c, kUiFamilyPreHotfix2) ||
                 // 0xABB64F60A774AAB8 is a game/particle draw family, not UI.
                 // Do not hardcode it into the detached OpenXR panel.
                 // Steam Build 25577316 hotfix equivalents of those exact
                 // call-stack families.  The game update relocated the EXE
                 // return RVAs, so the FNV stack hashes changed even though
                 // the underlying UI draw families did not.
-                (g_autoUiFamilyAEnabled && hash == 0x0CFC42F8ABB7D59CULL);
+                (g_autoUiFamilyAEnabled && UiCandidateIsFamily(c, kUiFamilyA));
             if (g_selectedUiCandidate < 0) g_selectedUiCandidate = 0;
+
+            // one line per new family (max kMaxUiCandidates per session) so the
+            // update proof id of known families can be captured.
+            char stackText[192] = {};
+            size_t used = 0;
+            for (unsigned int i = 0; i < rvaCount; ++i)
+            {
+                char one[24] = {};
+                sprintf_s(one, sizeof(one), "%s0x%llX", i ? "," : "",
+                    static_cast<unsigned long long>(rvas[i]));
+                const size_t n = strlen(one);
+                if (used + n + 1 >= sizeof(stackText)) break;
+                memcpy(stackText + used, one, n);
+                used += n;
+                stackText[used] = 0;
+            }
+            const char* known =
+                UiCandidateIsFamily(c, kUiFamilyA) ? "A" :
+                UiCandidateIsFamily(c, kUiFamilyB) ? "B" :
+                UiCandidateIsFamily(c, kUiFamilyKeepAlive) ? "KEEPALIVE" :
+                (UiCandidateIsFamily(c, kUiFamilyPreHotfix1) ||
+                 UiCandidateIsFamily(c, kUiFamilyPreHotfix2)) ? "PREHOTFIX" : "-";
+            char frameText[320] = {};
+            used = 0;
+            for (unsigned int i = 0; i < rvaCount; ++i)
+            {
+                char one[40] = {};
+                sprintf_s(one, sizeof(one), "%s0x%llXULL", i ? "," : "",
+                    static_cast<unsigned long long>(c.canonFrames[i]));
+                const size_t n = strlen(one);
+                if (used + n + 1 >= sizeof(frameText)) break;
+                memcpy(frameText + used, one, n);
+                used += n;
+                frameText[used] = 0;
+            }
+            LogCategory("UI", "UI_FAMILY_NEW #%u known=%s op=%u legacy=0x%016llX canon=0x%016llX count=%u stack=[%s] frames={%s}",
+                static_cast<unsigned>(index + 1), known, drawOp,
+                static_cast<unsigned long long>(hash),
+                static_cast<unsigned long long>(canon), rvaCount, stackText, frameText);
         }
 
         UiDrawCandidate& c = g_uiCandidates[index];
@@ -518,7 +652,7 @@
         {
             g_autoUiFamilyAEnabled = !g_autoUiFamilyAEnabled;
             for (unsigned int i = 0; i < g_uiCandidateCount; ++i)
-                if (g_uiCandidates[i].hash == 0x0CFC42F8ABB7D59CULL)
+                if (UiCandidateIsFamily(g_uiCandidates[i], kUiFamilyA))
                     g_uiCandidates[i].markedUi = g_autoUiFamilyAEnabled;
             char line[160] = {};
             sprintf_s(line, sizeof(line), "AUTO_UI_FAMILY_A enabled=%d\n", g_autoUiFamilyAEnabled ? 1 : 0);
@@ -598,7 +732,7 @@
             g_canvasUiRedirectEnabled &&
             g_nativeVrColorSurface &&
             g_nativeVrWidth && g_nativeVrHeight &&
-            returnRva == 0x760236 &&
+            returnRva == GameRva(GA_CanvasUiDrawRet) &&
             viewportWidth == g_nativeVrWidth &&
             (arg4 == static_cast<unsigned long long>(g_nativeVrHeight) ||
              (NewSequentialStereoCroppedUiHeight(g_nativeVrWidth, g_nativeVrHeight) &&
@@ -609,7 +743,7 @@
         // batch/RCX, and batch+0x1E0 as context/RDX to 0x7A19C0. Log both;
         // this is an identity for render-command backing data, NOT evidence
         // that the most recent Canvas finalization owns the queued geometry.
-        if (CanvasTraceIsActive() && returnRva == 0x760236 &&
+        if (CanvasTraceIsActive() && returnRva == GameRva(GA_CanvasUiDrawRet) &&
             g_canvasTraceFlushLogCount++ < 600)
         {
             LogCategory("UI", "CANVAS_TRACE_FLUSH frame=%llu batch=%p "
@@ -626,7 +760,7 @@
 
         // Use only state already visible in this module; do not depend on the
         // D3D device global or mutate renderer-owned state.
-        if (returnRva == 0x760236 && g_canvasUiRedirectLogCount < 96)
+        if (returnRva == GameRva(GA_CanvasUiDrawRet) && g_canvasUiRedirectLogCount < 96)
         {
             char line[256] = {};
             sprintf_s(line, sizeof(line),
@@ -683,8 +817,9 @@
         if (!exe)
             return false;
 
-        void* target = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(exe) + kCanvasBatchFlushRva);
+        void* target = GameAddrAs<void*>(GA_CanvasBatchFlush);
+        if (!target)
+            return false;
 
         MH_STATUS st = MH_CreateHook(
             target,
@@ -704,7 +839,7 @@
         return true;
     }
 
-    static constexpr uintptr_t kCanvasFinalizeCandidateRva = 0x768AD0;
+    // reference build rva 0x768AD0, found per game build (GA_CanvasFinalize).
     using CanvasFinalizeCandidateFn = void (*)(void* canvasObject);
     static CanvasFinalizeCandidateFn g_originalCanvasFinalizeCandidate = nullptr;
     static bool g_canvasFinalizeHookInstalled = false;
@@ -829,8 +964,8 @@
     //
     // Normalize the *matrix argument* instead.  This gives the Canvas/HUD a
     // stable mono X origin while leaving the actual AFR FSceneView untouched.
-    static constexpr uintptr_t kCanvasTransformAppendRva = 0x765030;
-    static constexpr uintptr_t kPerPlayerCanvasTransformReturnRva = 0x5D8AF4;
+    // reference build rvas 0x765030 / 0x5D8AF4, found per game build.
+    #define kPerPlayerCanvasTransformReturnRva (GameRva(GA_PerPlayerCanvasTransformRet))
 
     using CanvasTransformAppendFn = void (*)(void* transformStack, const float* matrix4x4);
     static CanvasTransformAppendFn g_originalCanvasTransformAppend = nullptr;
@@ -899,8 +1034,12 @@
             return false;
         }
 
-        void* target = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(exe) + kCanvasTransformAppendRva);
+        void* target = GameAddrAs<void*>(GA_CanvasTransformAppend);
+        if (!target || !GameAddr(GA_PerPlayerCanvasTransformRet))
+        {
+            CanvasFinalizeLog("AFR Canvas transform hook: not found in this game build\n");
+            return false;
+        }
 
         MH_STATUS status = MH_CreateHook(
             target,
@@ -949,8 +1088,12 @@
             return false;
         }
 
-        void* target = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(exe) + kCanvasFinalizeCandidateRva);
+        void* target = GameAddrAs<void*>(GA_CanvasFinalize);
+        if (!target)
+        {
+            CanvasFinalizeLog("Canvas full-width test: not found in this game build\n");
+            return false;
+        }
 
         MH_STATUS status = MH_CreateHook(
             target,
@@ -1002,9 +1145,12 @@
             return false;
         }
 
-        void* address = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(exe) + kCalcSceneViewCandidateRva
-            );
+        void* address = GameAddrAs<void*>(GA_CalcSceneView);
+        if (!address)
+        {
+            DebugLog("CalcSceneView candidate: not found in this game build\n");
+            return false;
+        }
 
         char line[256] = {};
         sprintf_s(

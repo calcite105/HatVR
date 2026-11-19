@@ -1059,9 +1059,12 @@ static float* HookedPerspectiveMatrixCandidate(
             return false;
         }
 
-        void* target = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(exe) + kPerspectiveMatrixCandidateRva
-            );
+        void* target = GameAddrAs<void*>(GA_PerspectiveMatrix);
+        if (!target)
+        {
+            DebugLog("Perspective matrix: not found in this game build\n");
+            return false;
+        }
 
         char line[256] = {};
         sprintf_s(
@@ -1262,8 +1265,11 @@ static float* HookedPerspectiveMatrixCandidate(
         DiscoverRHIBackend2A0(rhi);
 
         // Concrete D3D9 RHI stores IDirect3DDevice9* at +0x34.
-        IDirect3DDevice9* device = rhi
-            ? *reinterpret_cast<IDirect3DDevice9**>(static_cast<unsigned char*>(rhi) + 0x34)
+        // the offset is read from the game's own SetRenderTarget code now, since it's
+        // +0x3C on newer builds where the rhi class got bigger.
+        static const int deviceField = GameFieldOffset(GA_RhiDeviceField);
+        IDirect3DDevice9* device = (rhi && deviceField >= 0)
+            ? *reinterpret_cast<IDirect3DDevice9**>(static_cast<unsigned char*>(rhi) + deviceField)
             : nullptr;
 
         // Let UE3 perform its normal render-target change first.
@@ -1313,15 +1319,21 @@ static float* HookedPerspectiveMatrixCandidate(
         if (!exe) return false;
         const uintptr_t base = reinterpret_cast<uintptr_t>(exe);
 
-        struct HookSpec { uintptr_t rva; void* hook; void** original; const char* name; } specs[] = {
-            { 0x3F0E10, reinterpret_cast<void*>(&HookedViewportGetSizeX), reinterpret_cast<void**>(&g_originalViewportGetSizeX), "FViewport::GetSizeX" },
-            { 0x896620, reinterpret_cast<void*>(&HookedViewportGetSizeY), reinterpret_cast<void**>(&g_originalViewportGetSizeY), "FViewport::GetSizeY" },
-            { 0xA25390, reinterpret_cast<void*>(&HookedRHISetRenderTarget), reinterpret_cast<void**>(&g_originalRHISetRenderTarget), "D3D9RHI::SetRenderTarget" },
+        (void)base;
+        struct HookSpec { GameAddrId id; void* hook; void** original; const char* name; } specs[] = {
+            { GA_ViewportGetSizeX, reinterpret_cast<void*>(&HookedViewportGetSizeX), reinterpret_cast<void**>(&g_originalViewportGetSizeX), "FViewport::GetSizeX" },
+            { GA_ViewportGetSizeY, reinterpret_cast<void*>(&HookedViewportGetSizeY), reinterpret_cast<void**>(&g_originalViewportGetSizeY), "FViewport::GetSizeY" },
+            { GA_RhiSetRenderTarget, reinterpret_cast<void*>(&HookedRHISetRenderTarget), reinterpret_cast<void**>(&g_originalRHISetRenderTarget), "D3D9RHI::SetRenderTarget" },
         };
 
         for (auto& spec : specs)
         {
-            void* target = reinterpret_cast<void*>(base + spec.rva);
+            void* target = GameAddrAs<void*>(spec.id);
+            if (!target)
+            {
+                DxvkPathTrace("NATIVE VR RES: %s not found in this game build", spec.name);
+                return false;
+            }
             MH_STATUS st = MH_CreateHook(target, spec.hook, spec.original);
             if (st != MH_OK && st != MH_ERROR_ALREADY_CREATED)
             {
@@ -1763,11 +1775,9 @@ static float* HookedPerspectiveMatrixCandidate(
                         rightViewMatrix[12] -= ipdUU;
 
                         using RebuildViewFn = void(__fastcall*)(void*, int);
-                        const uintptr_t exeBase =
-                            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-                        auto rebuild = reinterpret_cast<RebuildViewFn>(
-                            exeBase + 0x80A190);
-                        rebuild(camRight, 0);
+                        auto rebuild = GameAddrAs<RebuildViewFn>(GA_RebuildView);
+                        if (rebuild)
+                            rebuild(camRight, 0);
                     }
                     __except (EXCEPTION_EXECUTE_HANDLER) {}
                 }

@@ -123,15 +123,12 @@ static void __fastcall AV_V90HookedSetBase(
 static bool AV_V90InstallSetBaseHook()
 {
     if(g_avV90SetBaseInstalled) return true;
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr);
-    if(!exe) return false;
-
-    constexpr uintptr_t kSetBaseRva=0x37DF10;
-    constexpr uintptr_t kGetBoneIndexRva=0x69E5D0;
+    if(!GameGroupAvailable("avatar")) return false;
+    const uintptr_t kSetBaseRva=GameRva(GA_SetBase);
     if(!g_avV88GetBoneIndex)
-        g_avV88GetBoneIndex=(AV_V88GetBoneIndexFn)(exe+kGetBoneIndexRva);
+        g_avV88GetBoneIndex=GameAddrAs<AV_V88GetBoneIndexFn>(GA_GetBoneIndex);
 
-    void* target=(void*)(exe+kSetBaseRva);
+    void* target=GameAddrAs<void*>(GA_SetBase);
     MH_STATUS st=MH_CreateHook(target,&AV_V90HookedSetBase,
         reinterpret_cast<void**>(&g_avV90OriginalSetBase));
     if(st!=MH_OK && st!=MH_ERROR_ALREADY_CREATED){
@@ -157,10 +154,9 @@ static bool AV_V90InstallSetBaseHook()
 static bool AV_V215InstallBuildRefToLocalHook()
 {
     if(g_avV215HookInstalled) return true;
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr);
-    if(!exe) return false;
-    constexpr uintptr_t kRva=0x6CE6E0;
-    void* target=(void*)(exe+kRva);
+    if(!GameGroupAvailable("avatar")) return false;
+    const uintptr_t kRva=GameRva(GA_BuildRefToLocal);
+    void* target=GameAddrAs<void*>(GA_BuildRefToLocal);
     MH_STATUS st=MH_CreateHook(target,&AV_V215HookedBuildRefToLocal,
         reinterpret_cast<void**>(&g_avV215OriginalBuildRefToLocal));
     if(st!=MH_OK && st!=MH_ERROR_ALREADY_CREATED){
@@ -181,11 +177,9 @@ static bool AV_V40InstallComposeHook()
 {
     if(g_avV40ComposeHookInstalled)return true;
 
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr);
-    if(!exe)return false;
-
-    constexpr uintptr_t kComposeRva=0x698B40;
-    void* target=(void*)(exe+kComposeRva);
+    if(!GameGroupAvailable("avatar"))return false;
+    const uintptr_t kComposeRva=GameRva(GA_ComposeSpaceBases);
+    void* target=GameAddrAs<void*>(GA_ComposeSpaceBases);
 
     MH_STATUS st=MH_CreateHook(
         target,
@@ -224,11 +218,9 @@ static bool AV_V27InstallPoseEvalHook()
 {
     if(g_avV27HookInstalled)return true;
 
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr);
-    if(!exe)return false;
-
-    constexpr uintptr_t kPoseEvalRva=0x6A5180;
-    void* target=(void*)(exe+kPoseEvalRva);
+    if(!GameGroupAvailable("avatar"))return false;
+    const uintptr_t kPoseEvalRva=GameRva(GA_PoseEval);
+    void* target=GameAddrAs<void*>(GA_PoseEval);
 
     MH_STATUS st=MH_CreateHook(
         target,
@@ -266,8 +258,8 @@ static bool AV_V27InstallPoseEvalHook()
 static bool AV_V29InstallPostPoseHook()
 {
     if(g_avV29HookInstalled)return true;
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr); if(!exe)return false;
-    void* target=(void*)(exe+0x6A4980);
+    if(!GameGroupAvailable("avatar"))return false;
+    void* target=GameAddrAs<void*>(GA_PostPose);
     MH_STATUS st=MH_CreateHook(target,&AV_V29HookedPostPose,reinterpret_cast<void**>(&g_avV29OriginalPostPose));
     if(st!=MH_OK && st!=MH_ERROR_ALREADY_CREATED){ FP_Log("AV_V29_4B90_CREATE_FAIL\n"); return false; }
     st=MH_EnableHook(target);
@@ -278,15 +270,15 @@ static bool AV_V29InstallPostPoseHook()
 static bool AV_V29InstallBranchHooks()
 {
     if(g_avV29BranchHooksInstalled)return true;
-    const uintptr_t exe=(uintptr_t)GetModuleHandleW(nullptr); if(!exe)return false;
-    struct H { uintptr_t rva; void* detour; void** original; const char* name; };
+    if(!GameGroupAvailable("avatar"))return false;
+    struct H { GameAddrId id; void* detour; void** original; const char* name; };
     H hs[]={
-        {0x35A3B0,(void*)&AV_V29Hooked3590D0,(void**)&g_avV29Original3590D0,"3590D0"},
-        {0x35A3F0,(void*)&AV_V29Hooked359110,(void**)&g_avV29Original359110,"359110"},
-        {0x359A60,(void*)&AV_V29Hooked358780,(void**)&g_avV29Original358780,"358780"}
+        {GA_BranchA,(void*)&AV_V29Hooked3590D0,(void**)&g_avV29Original3590D0,"3590D0"},
+        {GA_BranchB,(void*)&AV_V29Hooked359110,(void**)&g_avV29Original359110,"359110"},
+        {GA_BranchC,(void*)&AV_V29Hooked358780,(void**)&g_avV29Original358780,"358780"}
     };
     for(auto& h:hs){
-        void* target=(void*)(exe+h.rva);
+        void* target=GameAddrAs<void*>(h.id);
         MH_STATUS st=MH_CreateHook(target,h.detour,h.original);
         if(st!=MH_OK && st!=MH_ERROR_ALREADY_CREATED){ char l[192]{}; sprintf_s(l,sizeof(l),"AV_V29_BRANCH_CREATE_FAIL %s status=%d\n",h.name,(int)st); FP_Log(l); return false; }
         st=MH_EnableHook(target);

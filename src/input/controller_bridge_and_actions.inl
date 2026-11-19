@@ -649,21 +649,29 @@
         auto* module = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
         if (!module) return;
 
-        g_hatVrFStringAssign = reinterpret_cast<HatVrFStringAssignFn>(
-            module + 0x1BE490);
+        // icon replacement needs FString assignment plus both getters.
+        if (!GameGroupAvailable("icons"))
+        {
+            LogCategory("INPUT", "controller icon functions not found in this game build; icon replacement disabled");
+            g_hatVrAHiTControllerHooksInstalled = true; // lookup is final, don't retry/log every call
+            return;
+        }
+        g_hatVrFStringAssign = GameAddrAs<HatVrFStringAssignFn>(GA_FStringAssign);
 
-        struct HookSpec { uintptr_t rva; void* detour; void** original; };
+        struct HookSpec { GameAddrId id; void* detour; void** original; };
         HookSpec hooks[] = {
-            { 0xA99680, reinterpret_cast<void*>(&HatVrHookedGetGamepadName),
+            { GA_GetGamepadName, reinterpret_cast<void*>(&HatVrHookedGetGamepadName),
                 reinterpret_cast<void**>(&g_hatVrOriginalGetGamepadName) },
-            { 0xA99260, reinterpret_cast<void*>(&HatVrHookedGetGamepadButtonIcon),
+            { GA_GetGamepadButtonIcon, reinterpret_cast<void*>(&HatVrHookedGetGamepadButtonIcon),
                 reinterpret_cast<void**>(&g_hatVrOriginalGetGamepadButtonIcon) },
         };
 
         bool any = false;
         for (auto& hook : hooks)
         {
-            void* target = module + hook.rva;
+            void* target = GameAddrAs<void*>(hook.id);
+            if (!target)
+                continue;
             MH_STATUS st = MH_CreateHook(target, hook.detour, hook.original);
             if (st != MH_OK && st != MH_ERROR_ALREADY_CREATED)
                 continue;

@@ -29,6 +29,13 @@ static bool FP_ReadMemory(const void* address, void* output, size_t bytes)
         &bytesRead) != FALSE && bytesRead == bytes;
 }
 
+// ue3 FName::Names (TArray<FNameEntry*>), Data at +0, Count at +8, Max at +0xC.
+// found per game build by signature (reference build rva 0x125CCE8), 0 if it can't be found.
+static uintptr_t FP_GNamesArrayAddress()
+{
+    return GameAddr(GA_GNames);
+}
+
 static bool FP_TryReadPointer(const void* address, uintptr_t& value)
 {
     value = 0;
@@ -293,7 +300,7 @@ static bool FP_V18ValidateNamesArray(
         "data=%p count=%d max=%d Pawn=%d Location=%d Mesh=%d score=%d/%d\n",
         descriptorKind,
         reinterpret_cast<void*>(descriptorAddress),
-        (descriptorAddress >= base && descriptorAddress < base + 0x1464000ULL)
+        (descriptorAddress >= base && descriptorAddress < base + GameImageSize())
             ? static_cast<unsigned long long>(descriptorAddress - base) : 0ULL,
         reinterpret_cast<void*>(arr.Data), arr.Count, arr.Max,
         pawnIndex, locationIndex, meshIndex, good, tested);
@@ -327,9 +334,15 @@ static bool FP_V18FindGNames()
     //
     // these globals are in zero-fill/BSS-style image memory beyond the raw
     // chance to see the real descriptor.
-    constexpr uintptr_t kNamesDataRva  = 0x125CCE8ULL;
-    constexpr uintptr_t kNamesCountRva = 0x125CCF0ULL;
-    constexpr uintptr_t kNamesMaxRva   = 0x125CCF4ULL;
+    const uintptr_t namesArray = FP_GNamesArrayAddress();
+    if (!namesArray)
+    {
+        FP_Log("FP_V19_GNAMES not found in this game build; name lookups disabled\n");
+        return false;
+    }
+    const uintptr_t kNamesDataRva  = namesArray - base;
+    const uintptr_t kNamesCountRva = kNamesDataRva + 0x8;
+    const uintptr_t kNamesMaxRva   = kNamesDataRva + 0xC;
 
     FP_V18TArray64 arr{};
     if (!FP_V18ReadPtr(base + kNamesDataRva, arr.Data) ||
@@ -1457,8 +1470,8 @@ static bool FP_V125RawNameFromIndex(int32_t index, char* out, size_t outSize)
     uintptr_t data = 0;
     int32_t count = 0;
     if (!exe ||
-        !FP_V18ReadPtr(exe + 0x125CCE8, data) ||
-        !FP_V18ReadI32(exe + 0x125CCF0, count) ||
+        !FP_V18ReadPtr(FP_GNamesArrayAddress(), data) ||
+        !FP_V18ReadI32((FP_GNamesArrayAddress() + 0x8), count) ||
         !FP_V111PlausiblePtr(data) || index >= count)
         return false;
 
@@ -1644,6 +1657,153 @@ static void FP_V129DiscoverApplyCameraModes(uintptr_t camera)
 using FP_V130ApplyCameraModesFn = void(__fastcall*)(
     void*, void*, float, FVectorUE3*, FRotatorUE3*, float*, void*);
 
+// ---------------------------------------------------------------------------
+// first person body lag diagnostic (just logs, doesn't change anything).
+//
+// the first person camera is anchored to Pawn.Location read in
+// ApplyCameraModes, and the body is drawn with the Mesh component's LocalToWorld.
+// if those come from different points in the frame, the camera ends up ahead of or behind
+// the body while moving. while the pawn moves this logs (max ~10hz, 400 lines):
+//   camBase   pawn location the camera was anchored to (ApplyCameraModes)
+//   pawnNow   pawn location at GetPlayerViewPoint
+//   meshT     mesh LocalToWorld translation (what actually gets drawn)
+//   step      how far the pawn moved since the last logged frame
+// meshT - pawnNow should be a fixed offset when the mesh is up to date, if it swings by
+// about one frame's worth of movement while walking, the body is being drawn a frame late.
+// ---------------------------------------------------------------------------
+static bool AV_V230ReadLocalToWorld(uintptr_t comp, float m[16]); // avatar/arm_ik_and_controller_targets.inl
+
+static FVectorUE3 g_fpLagCamBase{};
+static uintptr_t g_fpLagCamBasePawn = 0;
+static unsigned long long g_fpLagCamBaseFrame = 0;
+static int32_t g_fpLagMeshOffset = -2;      // -2 not looked up yet, -1 failed
+static FVectorUE3 g_fpLagPrevPawn{};
+static bool g_fpLagHavePrev = false;
+static ULONGLONG g_fpLagLastLogMs = 0;
+static unsigned int g_fpLagLines = 0;
+
+static void FP_BodyLagNoteCameraBase(void* pawn, const FVectorUE3& pawnLocation)
+{
+    g_fpLagCamBase = pawnLocation;
+    g_fpLagCamBasePawn = reinterpret_cast<uintptr_t>(pawn);
+    g_fpLagCamBaseFrame = g_presentFrameNumber;
+}
+
+// update rate counters, logged once a second while first person is on:
+//   calls      GetPlayerViewPoint calls (game frames)
+//   frames     how many different present frames were seen
+//   pawnMoved  calls where the pawn moved
+//   meshMoved  calls where the body mesh's drawn transform changed
+//   meshStill  calls where the pawn moved but the body mesh didn't
+// if the body updates every frame, meshStill should stay around 0 while walking.
+static unsigned int g_fpRateCalls = 0, g_fpRatePawnMoved = 0, g_fpRateMeshMoved = 0,
+    g_fpRateMeshStill = 0, g_fpRateFrames = 0, g_fpRateLines = 0;
+static unsigned long long g_fpRateLastFrame = ~0ULL;
+static ULONGLONG g_fpRateWindowStart = 0;
+static float g_fpRatePrevMesh[3] = {};
+static bool g_fpRateHavePrevMesh = false;
+static FVectorUE3 g_fpRatePrevPawn{};
+static bool g_fpRateHavePrevPawn = false;
+
+static void FP_BodyRateSample(uintptr_t pawn, const FVectorUE3& pawnNow)
+{
+    if (g_fpRateLines >= 300 || !pawn || g_fpLagMeshOffset < 0)
+        return;
+    uintptr_t mesh = 0;
+    float l2w[16] = {};
+    if (!FP_V18ReadPtr(pawn + static_cast<uintptr_t>(g_fpLagMeshOffset), mesh) ||
+        !AV_V230ReadLocalToWorld(mesh, l2w))
+        return;
+
+    ++g_fpRateCalls;
+    if (g_presentFrameNumber != g_fpRateLastFrame)
+    {
+        ++g_fpRateFrames;
+        g_fpRateLastFrame = g_presentFrameNumber;
+    }
+    const bool pawnMoved = g_fpRateHavePrevPawn &&
+        (fabsf(pawnNow.X - g_fpRatePrevPawn.X) + fabsf(pawnNow.Y - g_fpRatePrevPawn.Y) +
+         fabsf(pawnNow.Z - g_fpRatePrevPawn.Z)) > 0.05f;
+    const bool meshMoved = g_fpRateHavePrevMesh &&
+        (fabsf(l2w[12] - g_fpRatePrevMesh[0]) + fabsf(l2w[13] - g_fpRatePrevMesh[1]) +
+         fabsf(l2w[14] - g_fpRatePrevMesh[2])) > 0.05f;
+    g_fpRatePawnMoved += pawnMoved ? 1u : 0u;
+    g_fpRateMeshMoved += meshMoved ? 1u : 0u;
+    g_fpRateMeshStill += (pawnMoved && !meshMoved) ? 1u : 0u;
+    g_fpRatePrevPawn = pawnNow;
+    g_fpRateHavePrevPawn = true;
+    g_fpRatePrevMesh[0] = l2w[12]; g_fpRatePrevMesh[1] = l2w[13]; g_fpRatePrevMesh[2] = l2w[14];
+    g_fpRateHavePrevMesh = true;
+
+    const ULONGLONG now = GetTickCount64();
+    if (!g_fpRateWindowStart)
+        g_fpRateWindowStart = now;
+    if (now - g_fpRateWindowStart < 1000)
+        return;
+    if (g_fpRatePawnMoved > 0)   // only report when there was movement
+    {
+        ++g_fpRateLines;
+        LogCategory("FP_RATE",
+            "calls=%u frames=%u pawnMoved=%u meshMoved=%u meshStillWhilePawnMoved=%u",
+            g_fpRateCalls, g_fpRateFrames, g_fpRatePawnMoved, g_fpRateMeshMoved, g_fpRateMeshStill);
+    }
+    g_fpRateCalls = g_fpRateFrames = g_fpRatePawnMoved = g_fpRateMeshMoved = g_fpRateMeshStill = 0;
+    g_fpRateWindowStart = now;
+}
+
+static void FP_BodyLagSample(uintptr_t pawn, const FVectorUE3& pawnNow)
+{
+    FP_BodyRateSample(pawn, pawnNow);
+    if (g_fpLagLines >= 400 || !pawn)
+        return;
+
+    const float stepX = g_fpLagHavePrev ? pawnNow.X - g_fpLagPrevPawn.X : 0.0f;
+    const float stepY = g_fpLagHavePrev ? pawnNow.Y - g_fpLagPrevPawn.Y : 0.0f;
+    const float stepZ = g_fpLagHavePrev ? pawnNow.Z - g_fpLagPrevPawn.Z : 0.0f;
+    g_fpLagPrevPawn = pawnNow;
+    const bool hadPrev = g_fpLagHavePrev;
+    g_fpLagHavePrev = true;
+    if (!hadPrev || (fabsf(stepX) + fabsf(stepY) + fabsf(stepZ)) < 0.5f)
+        return;   // only while moving
+
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_fpLagLastLogMs < 100)
+        return;
+    g_fpLagLastLogMs = now;
+
+    if (g_fpLagMeshOffset == -2)
+    {
+        g_fpLagMeshOffset = -1;
+        uintptr_t pawnClass = 0, meshProp = 0;
+        unsigned int meshNext = 0;
+        int32_t off = -1;
+        if (FP_V110ObjectClass(pawn, pawnClass) &&
+            FP_V111FindField(pawnClass, "Mesh", meshProp, meshNext) &&
+            FP_V111DiscoverPropertyOffset(meshProp, pawn, FP_V111_Value_Object, off))
+            g_fpLagMeshOffset = off;
+        LogCategory("FP_LAG", "Pawn.Mesh offset=%d", g_fpLagMeshOffset);
+    }
+
+    uintptr_t mesh = 0;
+    float l2w[16] = {};
+    const bool haveMesh = g_fpLagMeshOffset >= 0 &&
+        FP_V18ReadPtr(pawn + static_cast<uintptr_t>(g_fpLagMeshOffset), mesh) &&
+        AV_V230ReadLocalToWorld(mesh, l2w);
+
+    ++g_fpLagLines;
+    LogCategory("FP_LAG",
+        "frame=%llu camFrame=%llu samePawn=%d step=(%.2f %.2f %.2f) "
+        "camBase-pawnNow=(%.2f %.2f %.2f) meshT-pawnNow=%s(%.2f %.2f %.2f)",
+        g_presentFrameNumber, g_fpLagCamBaseFrame,
+        g_fpLagCamBasePawn == pawn ? 1 : 0,
+        stepX, stepY, stepZ,
+        g_fpLagCamBase.X - pawnNow.X, g_fpLagCamBase.Y - pawnNow.Y, g_fpLagCamBase.Z - pawnNow.Z,
+        haveMesh ? "" : "UNAVAILABLE",
+        haveMesh ? l2w[12] - pawnNow.X : 0.0f,
+        haveMesh ? l2w[13] - pawnNow.Y : 0.0f,
+        haveMesh ? l2w[14] - pawnNow.Z : 0.0f);
+}
+
 static FP_V130ApplyCameraModesFn g_fpV130OriginalApplyCameraModes = nullptr;
 static bool g_fpV130HookInstalled = false;
 static ULONGLONG g_fpV130LastLog = 0;
@@ -1671,6 +1831,7 @@ static void __fastcall FP_V130HookedApplyCameraModes(
     camEnd->X = pawnLocation.X;
     camEnd->Y = pawnLocation.Y;
     camEnd->Z = pawnLocation.Z + 28.0f;
+    FP_BodyLagNoteCameraBase(pawn, pawnLocation);
 
     // continues running after ApplyCameraModes; if AHiT later replaces this
     // value, that is the already-working camera yield we want to follow.
@@ -1702,8 +1863,13 @@ static bool FP_V130InstallApplyCameraModesHook()
     if (!exe)
         return false;
 
-    constexpr uintptr_t kNativeRva = 0xA89B70;
-    void* target = reinterpret_cast<void*>(exe + kNativeRva);
+    const uintptr_t kNativeRva = GameRva(GA_ApplyCameraModes);
+    void* target = GameAddrAs<void*>(GA_ApplyCameraModes);
+    if (!target)
+    {
+        FP_Log("FP_V130 ApplyCameraModes not found in this game build; first person camera hook disabled\n");
+        return false;
+    }
 
     MH_STATUS st = MH_CreateHook(
         target, &FP_V130HookedApplyCameraModes,
@@ -1737,6 +1903,51 @@ static bool FP_V130InstallApplyCameraModesHook()
         reinterpret_cast<void*>(g_fpV130OriginalApplyCameraModes));
     FP_Log(line);
     return true;
+}
+
+// disable player fade, done the same way the game's own camera badge does it.
+// the game builds the GameStateSetAndAcceptDecals float4 for each mesh draw in one
+// native function: .x shadow/cubemap capture, .y = 10 when the primitive's owner says
+// it's "cinematic" for the view (that's what the camera badge flips), .z music bpm, .w accept
+// decals. character materials check .y == 10 (IsCinematic) to skip the near camera fade.
+// forcing .y = 10 here (only for primitive draws) gives the same result as the camera badge,
+// without having to guess d3d registers and without touching .x/.z/.w. canvas/ui draws (no
+// primitive) keep the game's 0, same as with the camera badge.
+using FP_GameStateShaderValueFn = float* (__fastcall*)(float*, const void*, const void*, int);
+static FP_GameStateShaderValueFn g_fpOriginalGameStateShaderValue = nullptr;
+static bool g_fpPlayerFadeHookTried = false;
+
+static float* __fastcall FP_HookedGameStateShaderValue(
+    float* out, const void* view, const void* primitiveSceneInfo, int arg)
+{
+    float* result = g_fpOriginalGameStateShaderValue(out, view, primitiveSceneInfo, arg);
+    if (result && primitiveSceneInfo && g_fpV1Enabled && g_disablePlayerFade &&
+        !g_hatVrGameCameraActive)
+        result[1] = 10.0f;
+    return result;
+}
+
+static void FP_InstallPlayerFadeHook()
+{
+    if (g_fpPlayerFadeHookTried)
+        return;
+    g_fpPlayerFadeHookTried = true;
+
+    void* target = GameAddrAs<void*>(GA_GameStateShaderValue);
+    if (!target)
+    {
+        FP_Log("FP_FADE GameState shader value builder not found in this game build; Disable Player Fade unavailable\n");
+        return;
+    }
+    MH_STATUS st = MH_CreateHook(target, &FP_HookedGameStateShaderValue,
+        reinterpret_cast<void**>(&g_fpOriginalGameStateShaderValue));
+    if (st == MH_OK || st == MH_ERROR_ALREADY_CREATED)
+        st = MH_EnableHook(target);
+    char line[192] = {};
+    sprintf_s(line, sizeof(line), "FP_FADE hook target=%p rva=0x%llX status=%d\n",
+        target, static_cast<unsigned long long>(GameRva(GA_GameStateShaderValue)),
+        static_cast<int>(st));
+    FP_Log(line);
 }
 
 static uintptr_t g_fpV127RemoveCameraModeClassFn = 0;
@@ -1929,9 +2140,9 @@ static bool FP_V119RefreshExactGNamesIfNeeded(uintptr_t object)
 
     uintptr_t data = 0;
     int32_t count = 0, max = 0;
-    if (!FP_V18ReadPtr(exe + 0x125CCE8, data) ||
-        !FP_V18ReadI32(exe + 0x125CCF0, count) ||
-        !FP_V18ReadI32(exe + 0x125CCF4, max) ||
+    if (!FP_V18ReadPtr(FP_GNamesArrayAddress(), data) ||
+        !FP_V18ReadI32((FP_GNamesArrayAddress() + 0x8), count) ||
+        !FP_V18ReadI32((FP_GNamesArrayAddress() + 0xC), max) ||
         !FP_V111PlausiblePtr(data) || count <= 0 || max < count)
         return false;
 
@@ -2026,8 +2237,8 @@ static bool FP_V123FindRawNameIndex(const char* wanted, int32_t& indexOut)
     uintptr_t data = 0;
     int32_t count = 0;
     if (!exe ||
-        !FP_V18ReadPtr(exe + 0x125CCE8, data) ||
-        !FP_V18ReadI32(exe + 0x125CCF0, count) ||
+        !FP_V18ReadPtr(FP_GNamesArrayAddress(), data) ||
+        !FP_V18ReadI32((FP_GNamesArrayAddress() + 0x8), count) ||
         !FP_V111PlausiblePtr(data) || count <= 0 || count > 1000000)
         return false;
 
@@ -2290,7 +2501,7 @@ static void FP_V118DiscoverScriptBridge(uintptr_t pawn)
             mbi.State != MEM_COMMIT)
             continue;
 
-        const bool inExe = exeBase && fn >= exeBase && fn < exeBase + 0x20000000ull;
+        const bool inExe = exeBase && fn >= exeBase && fn < exeBase + GameImageSize();
         if (inExe)
         {
             sprintf_s(line, sizeof(line),
@@ -2430,23 +2641,35 @@ static bool FP_V143ExternalViewTarget(
 // makes this fail closed if a later game build changes either site.
 static bool FP_SetNearDitherCullingDisabled(bool disabled)
 {
-    HMODULE exe = GetModuleHandleW(nullptr);
-    if (!exe)
-        return false;
-
-    struct Site { uintptr_t rva; };
-    static const Site sites[] = {
-        { 0x752BE1ULL },
-        { 0x753861ULL },
+    // both sites are found per game build (reference rvas 0x752BE1 / 0x753861).
+    struct Site { GameAddrId id; uintptr_t rva; };
+    const Site sites[] = {
+        { GA_NearDitherSiteA, GameRva(GA_NearDitherSiteA) },
+        { GA_NearDitherSiteB, GameRva(GA_NearDitherSiteB) },
     };
 
     const unsigned char original[2] = { 0xF6, 0x47 }; // test byte ptr [rdi+58h],20h
     const unsigned char forceOff[2] = { 0xEB, 0x15 }; // jmp AHiT's xorps xmm6,xmm6
+    const unsigned char jumpLanding[3] = { 0x0F, 0x57, 0xF6 }; // xorps xmm6,xmm6 at site+2+0x15
 
     bool allOk = true;
     for (const Site& site : sites)
     {
-        auto* address = reinterpret_cast<unsigned char*>(exe) + site.rva;
+        auto* address = GameAddrAs<unsigned char*>(site.id);
+        if (!address)
+        {
+            FP_Log("FP_NEAR_DITHER site not found in this game build\n");
+            allOk = false;
+            continue;
+        }
+        // the forced jump is relative, so only patch it if it still lands on the
+        // instruction I expect in this build.
+        if (memcmp(address + 2 + 0x15, jumpLanding, sizeof(jumpLanding)) != 0)
+        {
+            FP_Log("FP_NEAR_DITHER REFUSED: jump landing changed in this game build\n");
+            allOk = false;
+            continue;
+        }
         const bool isOriginal = memcmp(address, original, sizeof(original)) == 0;
         const bool isForcedOff = memcmp(address, forceOff, sizeof(forceOff)) == 0;
 
@@ -2547,6 +2770,7 @@ static void FP_OnPlayerViewPoint(
     }
 
     FP_V130InstallApplyCameraModesHook();
+    FP_InstallPlayerFadeHook();
 
     if (!g_fpV1Enabled)
         return;
@@ -2575,6 +2799,8 @@ static void FP_OnPlayerViewPoint(
         }
         return;
     }
+
+    FP_BodyLagSample(pawn, pawnLocation);
 
     // FaceCamera should already have been primed before FP was enabled.
     const FVectorUE3 originalLocation = location;

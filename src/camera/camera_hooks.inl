@@ -17,7 +17,8 @@ extern bool  g_hatVrAnimHeadCameraOffsetValid;
     // we call the original first, then alter the finished gameplay POV BEFORE
     // CalcSceneView consumes it to construct the FSceneView and matrices.
 
-    static constexpr uintptr_t kGetPlayerViewPointCandidateRva = 0x402EC0;
+    // reference build rva 0x402EC0, found per game build by signature.
+    #define kGetPlayerViewPointCandidateRva (GameRva(GA_GetPlayerViewPoint))
 
     using GetPlayerViewPointCandidateFn = void (*)(
         void* playerController,
@@ -470,9 +471,12 @@ extern bool  g_hatVrAnimHeadCameraOffsetValid;
             return false;
         }
 
-        void* target = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(exe) + kGetPlayerViewPointCandidateRva
-            );
+        void* target = GameAddrAs<void*>(GA_GetPlayerViewPoint);
+        if (!target)
+        {
+            DebugLog("GetPlayerViewPoint candidate: not found in this game build\n");
+            return false;
+        }
 
         char line[320] = {};
         sprintf_s(

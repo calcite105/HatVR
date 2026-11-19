@@ -132,7 +132,7 @@
 
         // this recurring draw keeps the OpenXR UI from going stale/black after level transitions.
         // it did not produce anything visible in testing.
-        if (g_uiCandidates[candidateIndex].hash == 0xC8D52F2D0E25F48AULL)
+        if (UiCandidateIsFamily(g_uiCandidates[candidateIndex], kUiFamilyKeepAlive))
             return true;
 
         if (candidateIndex == g_selectedUiCandidate && g_uiCandidatePreviewMode != 0)
@@ -147,7 +147,7 @@
     {
         return candidateIndex >= 0 &&
             candidateIndex < static_cast<int>(g_uiCandidateCount) &&
-            g_uiCandidates[candidateIndex].hash == 0x08FBD6C0B1404765ULL;
+            UiCandidateIsFamily(g_uiCandidates[candidateIndex], kUiFamilyB);
     }
 
     // Experimental Recommended-renderer equivalent of r236's proven Family B
@@ -544,6 +544,8 @@
             !forceGameFramebuffer &&
             (insideUiScope || selectedCandidate) &&
             g_nativeVrColorSurface && self;
+
+
 
         // Live, bounded geometry census. A D3D9 vertex Y outside the 16:9
         // source RECT is evidence of possible clipping, not by itself proof
@@ -1354,150 +1356,13 @@
 
         return g_originalSetVertexShader(self, pShader);
     }
-    static float g_playerOcclusionPsConstants[224][4] = {};
-
-    static uint64_t HashPixelShaderBytecode(IDirect3DPixelShader9* shader)
-    {
-        if (!shader) return 0;
-        UINT size = 0;
-        if (FAILED(shader->GetFunction(nullptr, &size)) || !size) return 0;
-        std::vector<unsigned char> bytes(size);
-        if (FAILED(shader->GetFunction(bytes.data(), &size))) return 0;
-        uint64_t hash = 14695981039346656037ULL;
-        for (UINT i = 0; i < size; ++i)
-        {
-            hash ^= static_cast<uint64_t>(bytes[i]);
-            hash *= 1099511628211ULL;
-        }
-        return hash;
-    }
-
-    struct PlayerOcclusionSemanticCacheEntry
-    {
-        IDirect3DPixelShader9* shader = nullptr;
-        int gameStateRegister = -1;
-    };
-
-    static std::vector<PlayerOcclusionSemanticCacheEntry> g_playerOcclusionSemanticCache;
-    static int g_playerOcclusionCurrentGameStateRegister = -1;
-
-    // D3D9 CTAB records are embedded in the shader bytecode as a comment block.
-    // we deliberately parse only the small piece we need instead of depending on
-    // D3DX: locate GameStateSetAndAcceptDecals and return its float4 register.
-    static int PlayerOcclusionFindGameStateRegister(IDirect3DPixelShader9* shader)
-    {
-        if (!shader) return -1;
-
-        for (const auto& e : g_playerOcclusionSemanticCache)
-            if (e.shader == shader) return e.gameStateRegister;
-
-        int foundRegister = -1;
-        UINT byteCount = 0;
-        if (SUCCEEDED(shader->GetFunction(nullptr, &byteCount)) && byteCount >= 32)
-        {
-            std::vector<unsigned char> bytes(byteCount);
-            if (SUCCEEDED(shader->GetFunction(bytes.data(), &byteCount)))
-            {
-                const unsigned char tag[4] = { 'C', 'T', 'A', 'B' };
-                for (UINT pos = 0; pos + 4 + 28 <= byteCount; ++pos)
-                {
-                    if (memcmp(bytes.data() + pos, tag, 4) != 0) continue;
-
-                    const unsigned char* base = bytes.data() + pos + 4;
-                    const size_t remaining = static_cast<size_t>(byteCount) - (pos + 4);
-                    auto readU32 = [&](size_t off, DWORD& out) -> bool
-                    {
-                        if (off + 4 > remaining) return false;
-                        memcpy(&out, base + off, 4);
-                        return true;
-                    };
-                    auto readU16 = [&](size_t off, WORD& out) -> bool
-                    {
-                        if (off + 2 > remaining) return false;
-                        memcpy(&out, base + off, 2);
-                        return true;
-                    };
-
-                    DWORD tableSize=0, constantCount=0, constantInfoOff=0;
-                    if (!readU32(0, tableSize) || !readU32(12, constantCount) ||
-                        !readU32(16, constantInfoOff))
-                        continue;
-                    if (tableSize < 28 || constantCount > 1024) continue;
-
-                    // D3DXSHADER_CONSTANTINFO is 20 bytes. All CTAB offsets are
-                    // relative to the first byte of the constant-table header.
-                    for (DWORD i = 0; i < constantCount; ++i)
-                    {
-                        const size_t info = static_cast<size_t>(constantInfoOff) +
-                                            static_cast<size_t>(i) * 20u;
-                        DWORD nameOff=0;
-                        WORD registerSet=0, registerIndex=0, registerCount=0;
-                        if (!readU32(info + 0, nameOff) ||
-                            !readU16(info + 4, registerSet) ||
-                            !readU16(info + 6, registerIndex) ||
-                            !readU16(info + 8, registerCount))
-                            break;
-                        if (nameOff >= remaining) continue;
-
-                        const char* name = reinterpret_cast<const char*>(base + nameOff);
-                        const size_t maxName = remaining - nameOff;
-                        const void* nul = memchr(name, 0, maxName);
-                        if (!nul) continue;
-
-                        if (strcmp(name, "GameStateSetAndAcceptDecals") == 0)
-                        {
-                            // D3DXRS_FLOAT4 == 2. PlayerOcclusion only needs the
-                            // first register's .y component.
-                            if (registerSet == 2 && registerCount >= 1 && registerIndex < 224)
-                                foundRegister = static_cast<int>(registerIndex);
-                            break;
-                        }
-                    }
-                    if (foundRegister >= 0) break;
-                }
-            }
-        }
-
-        PlayerOcclusionSemanticCacheEntry entry{};
-        entry.shader = shader;
-        entry.gameStateRegister = foundRegister;
-        g_playerOcclusionSemanticCache.push_back(entry);
-        if (foundRegister >= 0)
-        {
-            const uint64_t hash = HashPixelShaderBytecode(shader);
-            LogCategory("FP_OCCLUSION",
-                "semantic match PS=%016llX GameStateSetAndAcceptDecals=c%d",
-                hash, foundRegister);
-        }
-        return foundRegister;
-    }
-
-    static void PlayerOcclusionForceCurrentSemantic(IDirect3DDevice9* self)
-    {
-        if (!self || !g_fpV1Enabled || !g_disablePlayerFade || g_hatVrGameCameraActive ||
-            g_playerOcclusionCurrentGameStateRegister < 0)
-            return;
-
-        const UINT reg = static_cast<UINT>(g_playerOcclusionCurrentGameStateRegister);
-        float value[4] = {};
-        if (SUCCEEDED(self->GetPixelShaderConstantF(reg, value, 1)))
-        {
-            value[1] = 10.0f;
-            g_originalSetPixelShaderConstantF(self, reg, value, 1);
-            memcpy(g_playerOcclusionPsConstants[reg], value, sizeof(value));
-        }
-    }
-
+    // disable player fade is handled natively now (FP_HookedGameStateShaderValue in
+    // first_person.inl), so pixel shader binds and constant uploads just pass through.
     static HRESULT STDMETHODCALLTYPE HookedSetPixelShader(
         IDirect3DDevice9* self, IDirect3DPixelShader9* pShader)
     {
         g_currentPixelShader = pShader;
-        g_playerOcclusionCurrentGameStateRegister =
-            PlayerOcclusionFindGameStateRegister(pShader);
-
-        const HRESULT hr = g_originalSetPixelShader(self, pShader);
-        if (SUCCEEDED(hr)) PlayerOcclusionForceCurrentSemantic(self);
-        return hr;
+        return g_originalSetPixelShader(self, pShader);
     }
 
     static HRESULT STDMETHODCALLTYPE HookedSetPixelShaderConstantF(
@@ -1506,35 +1371,6 @@
         const float* pConstantData,
         UINT Vector4fCount)
     {
-        if (pConstantData && StartRegister < 224)
-        {
-            const UINT count = (Vector4fCount > (224 - StartRegister))
-                ? (224 - StartRegister) : Vector4fCount;
-            memcpy(&g_playerOcclusionPsConstants[StartRegister][0],
-                   pConstantData, static_cast<size_t>(count) * 4u * sizeof(float));
-        }
-
-        if (pConstantData && g_fpV1Enabled && g_disablePlayerFade && !g_hatVrGameCameraActive &&
-            g_playerOcclusionCurrentGameStateRegister >= 0 && Vector4fCount > 0)
-        {
-            const UINT semanticReg =
-                static_cast<UINT>(g_playerOcclusionCurrentGameStateRegister);
-            const UINT endRegister = StartRegister + Vector4fCount;
-            if (StartRegister <= semanticReg && endRegister > semanticReg)
-            {
-                const size_t floatCount = static_cast<size_t>(Vector4fCount) * 4u;
-                float* patched = static_cast<float*>(_alloca(floatCount * sizeof(float)));
-                memcpy(patched, pConstantData, floatCount * sizeof(float));
-                patched[(semanticReg - StartRegister) * 4u + 1u] = 10.0f;
-
-                if (semanticReg < 224)
-                    g_playerOcclusionPsConstants[semanticReg][1] = 10.0f;
-
-                return g_originalSetPixelShaderConstantF(
-                    self, StartRegister, patched, Vector4fCount);
-            }
-        }
-
         return g_originalSetPixelShaderConstantF(self, StartRegister, pConstantData, Vector4fCount);
     }
 
@@ -1617,38 +1453,45 @@
         HudWindowRecordD3D("DIP", self, Type, PrimitiveCount);
 
 
-        IDirect3DVertexShader9* current = g_currentVertexShader;
-
-        RecordInspectorDraw(current);
-
-        // bytecode hash, independent of pointer address or draw-count rank.
-        ProbeKnownCameraShader(
-            self,
-            current,
-            PrimitiveCount,
-            NumVertices
-        );
-
-        IDirect3DVertexShader9* selected = nullptr;
-        if (!g_shaderInspector.empty() &&
-            g_shaderInspectorSelected >= 0 &&
-            g_shaderInspectorSelected < static_cast<int>(g_shaderInspector.size()))
+        // the shader inspector / camera constant probe are only for diagnostics. they
+        // scan through a shader list that keeps growing, so skip them completely on
+        // this per draw hot path unless debug tools are on.
+        if (g_debugToolsEnabled)
         {
-            selected = g_shaderInspector[g_shaderInspectorSelected].shader;
-        }
+            IDirect3DVertexShader9* current = g_currentVertexShader;
 
-        if (selected)
-        {
-            if (g_shaderDebugMode == ShaderDebugMode::HideSelected &&
-                current == selected)
+            RecordInspectorDraw(current);
+
+            // bytecode hash, independent of pointer address or draw-count rank.
+            ProbeKnownCameraShader(
+                self,
+                current,
+                PrimitiveCount,
+                NumVertices
+            );
+
+            IDirect3DVertexShader9* selected = nullptr;
+            if (g_shaderDebugMode != ShaderDebugMode::Normal &&
+                !g_shaderInspector.empty() &&
+                g_shaderInspectorSelected >= 0 &&
+                g_shaderInspectorSelected < static_cast<int>(g_shaderInspector.size()))
             {
-                return D3D_OK;
+                selected = g_shaderInspector[g_shaderInspectorSelected].shader;
             }
 
-            if (g_shaderDebugMode == ShaderDebugMode::SoloSelected &&
-                current != selected)
+            if (selected)
             {
-                return D3D_OK;
+                if (g_shaderDebugMode == ShaderDebugMode::HideSelected &&
+                    current == selected)
+                {
+                    return D3D_OK;
+                }
+
+                if (g_shaderDebugMode == ShaderDebugMode::SoloSelected &&
+                    current != selected)
+                {
+                    return D3D_OK;
+                }
             }
         }
 

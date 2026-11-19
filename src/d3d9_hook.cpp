@@ -43,38 +43,39 @@ ID3D9VkInteropDeviceHatVR : public IUnknown
 namespace ahitvr
 {
 
+// finds the game exe addresses by signature (has to come before anything that uses them).
+#include "core/game_addresses.inl"
+
     // HatVR live SystemSettings compatibility overrides.
     static void ForceLiveMotionBlurOff()
     {
-        HMODULE exe = GetModuleHandleW(nullptr);
-        if (!exe)
-        {
-            DxvkPathTrace("HatVR motion-blur compatibility: main EXE handle unavailable");
-            return;
-        }
-
-        const uintptr_t base = reinterpret_cast<uintptr_t>(exe);
-
         struct LiveSetting
         {
             const char* name;
-            uintptr_t rva;
+            GameAddrId id;
         };
 
         static const LiveSetting settings[] =
         {
-            { "MotionBlur",             0x11039CC },
-            { "MotionBlurPause",        0x11039D0 },
-            { "bAllowMotionBlurScreen", 0x1103A24 },
-            { "MotionBlurSkinning",     0x1103ADC },
-            { "MotionBlurSamples",      0x1103A58 },
+            { "MotionBlur",             GA_MotionBlur },
+            { "MotionBlurPause",        GA_MotionBlurPause },
+            { "bAllowMotionBlurScreen", GA_AllowMotionBlurScreen },
+            { "MotionBlurSkinning",     GA_MotionBlurSkinning },
+            { "MotionBlurSamples",      GA_MotionBlurSamples },
         };
 
         bool allOk = true;
         for (const LiveSetting& setting : settings)
         {
-            volatile LONG* value =
-                reinterpret_cast<volatile LONG*>(base + setting.rva);
+            const uintptr_t address = GameAddr(setting.id);
+            if (!address)
+            {
+                DxvkPathTrace("HatVR motion-blur compatibility: %s not found in this game build",
+                    setting.name);
+                allOk = false;
+                continue;
+            }
+            volatile LONG* value = reinterpret_cast<volatile LONG*>(address);
 
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(
